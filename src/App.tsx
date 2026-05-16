@@ -30,6 +30,9 @@ import {
 } from 'lucide-react';
 import { removeBackground } from '@imgly/background-removal';
 import JSZip from 'jszip';
+import { parseGIF, decompressFrames } from 'gifuct-js';
+// @ts-ignore
+import gifshot from 'gifshot';
 
 // --- Types ---
 
@@ -42,6 +45,10 @@ interface ProcessedFile {
   status: 'pending' | 'processing' | 'done' | 'error';
   error?: string;
   progress: number;
+  startTime?: number;
+  estimatedSeconds?: number;
+  gifFps?: number;
+  totalFrames?: number;
 }
 
 // --- MaskEditor Component ---
@@ -798,16 +805,44 @@ export default function App() {
   const [isProcessingAll, setIsProcessingAll] = useState(false);
   const [editingFileId, setEditingFileId] = useState<string | null>(null);
   const [previewFileId, setPreviewFileId] = useState<string | null>(null);
+  const [hardwareInfo, setHardwareInfo] = useState<{ capability: 'High' | 'Medium' | 'Standard', tech: string }>({ capability: 'Standard', tech: 'WASM' });
+  const [avgSpeed, setAvgSpeed] = useState<number | null>(null); // seconds per MB
+  const [showInfoSidebar, setShowInfoSidebar] = useState(false);
+  const [avgFrameSpeed, setAvgFrameSpeed] = useState<number | null>(null); // seconds per frame for GIFs
+
+  useEffect(() => {
+    const checkHardware = async () => {
+      // @ts-ignore
+      if (navigator.gpu) {
+        setHardwareInfo({ capability: 'High', tech: 'WebGPU (Ultra Fast)' });
+      } else if (window.crossOriginIsolated) {
+        setHardwareInfo({ capability: 'Medium', tech: 'WASM SIMD (Fast)' });
+      } else {
+        setHardwareInfo({ capability: 'Standard', tech: 'WASM (Standard)' });
+      }
+    };
+    checkHardware();
+  }, []);
+
+  const formatDuration = (seconds: number) => {
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = Math.round(seconds % 60);
+    return [h, m, s]
+      .map(v => v < 10 ? '0' + v : v)
+      .filter((v, i) => v !== '00' || i > 0) // Keep at least MM:SS
+      .join(':');
+  };
 
   const onDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
-    const droppedFiles = (Array.from(e.dataTransfer.files) as File[]).filter(file => file.type.startsWith('image/'));
+    const droppedFiles = (Array.from(e.dataTransfer.files) as File[]).filter(file => file.type.startsWith('image/') || file.type === 'image/gif');
     addFiles(droppedFiles);
   }, []);
 
   const onFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
-      const selectedFiles = (Array.from(e.target.files) as File[]).filter(file => file.type.startsWith('image/'));
+      const selectedFiles = (Array.from(e.target.files) as File[]).filter(file => file.type.startsWith('image/') || file.type === 'image/gif');
       addFiles(selectedFiles);
     }
   };
@@ -820,7 +855,8 @@ export default function App() {
       processedUrl: null,
       maskUrl: null,
       status: 'pending',
-      progress: 0
+      progress: 0,
+      gifFps: file.type === 'image/gif' ? 10 : undefined // Default 10 FPS for GIFs
     }));
     setFiles(prev => [...prev, ...newProcessedFiles]);
   };
@@ -836,18 +872,138 @@ export default function App() {
     });
   };
 
+  const processGif = async (id: string, file: File) => {
+    const startProcessTime = Date.now();
+    const fileItem = files.find(f => f.id === id);
+    const targetFps = fileItem?.gifFps || 10;
+    
+    try {
+      const buffer = await file.arrayBuffer();
+      const gif = parseGIF(buffer);
+      const frames = decompressFrames(gif, true);
+      
+      const originalDelay = frames[0].delay || 100;
+      const originalFps = 1000 / originalDelay;
+      
+      // Calculate how many frames to skip to match target FPS
+      const skipFactor = Math.max(1, Math.round(originalFps / targetFps));
+      const targetFrames = frames.filter((_, idx) => idx % skipFactor === 0);
+      
+      const totalFrames = targetFrames.length;
+      setFiles(prev => prev.map(f => f.id === id ? { ...f, totalFrames } : f));
+      const processedFrameUrls: string[] = [];
+
+      // Create a temporary canvas to extract frames
+      const tempCanvas = document.createElement('canvas');
+      const tempCtx = tempCanvas.getContext('2d');
+      if (!tempCtx) throw new Error('Could not create canvas context');
+
+      tempCanvas.width = targetFrames[0].dims.width;
+      tempCanvas.height = targetFrames[0].dims.height;
+
+      for (let i = 0; i < totalFrames; i++) {
+        const frame = targetFrames[i];
+        const frameStartTime = Date.now();
+        
+        // Update progress context
+        setFiles(prev => prev.map(f => f.id === id ? { 
+          ...f, 
+          status: 'processing', 
+          progress: Math.round(((i) / totalFrames) * 100) 
+        } : f));
+
+        // Create imageData from frame pixels
+        const imageData = new ImageData(
+          new Uint8ClampedArray(frame.patch),
+          frame.dims.width,
+          frame.dims.height
+        );
+
+        const frameCanvas = document.createElement('canvas');
+        frameCanvas.width = frame.dims.width;
+        frameCanvas.height = frame.dims.height;
+        const fCtx = frameCanvas.getContext('2d')!;
+        fCtx.putImageData(imageData, 0, 0);
+
+        // Convert to blob for background removal
+        const blob = await new Promise<Blob>((resolve) => frameCanvas.toBlob(b => resolve(b!), 'image/png'));
+        
+        // Remove background from this frame
+        const processedBlob = await removeBackground(blob);
+        const processedUrl = URL.createObjectURL(processedBlob);
+        processedFrameUrls.push(processedUrl);
+
+        const frameEndTime = Date.now();
+        const frameDuration = (frameEndTime - frameStartTime) / 1000;
+        setAvgFrameSpeed(prev => prev ? (prev * 0.9 + frameDuration * 0.1) : frameDuration);
+      }
+
+      setFiles(prev => prev.map(f => f.id === id ? { ...f, progress: 95 } : f));
+
+      // Re-encode with gifshot
+      gifshot.createGIF({
+        images: processedFrameUrls,
+        gifWidth: targetFrames[0].dims.width,
+        gifHeight: targetFrames[0].dims.height,
+        numFrames: totalFrames,
+        frameDuration: 10 / targetFps * 10, // gifshot frameDuration is in centiseconds (1/100s)
+        sampleInterval: 10,
+        transparent: '0x00FF00',
+      }, (obj: any) => {
+        // Revoke temporary frame URLs
+        processedFrameUrls.forEach(url => URL.revokeObjectURL(url));
+
+        if (!obj.error) {
+          const endProcessTime = Date.now();
+          const duration = (endProcessTime - startProcessTime) / 1000;
+          const speed = duration / (file.size / 1024 / 1024);
+          setAvgSpeed(prev => prev ? (prev * 0.7 + speed * 0.3) : speed);
+
+          setFiles(prev => prev.map(f => f.id === id ? { 
+            ...f, 
+            processedUrl: obj.image, 
+            status: 'done', 
+            progress: 100 
+          } : f));
+        } else {
+          setFiles(prev => prev.map(f => f.id === id ? { 
+            ...f, 
+            status: 'error', 
+            error: 'Failed to re-encode GIF' 
+          } : f));
+        }
+      });
+
+    } catch (err) {
+      console.error(err);
+      setFiles(prev => prev.map(f => f.id === id ? { ...f, status: 'error', error: 'Failed to process GIF' } : f));
+    }
+  };
+
   const processFile = async (id: string) => {
     const fileItem = files.find(f => f.id === id);
     if (!fileItem || fileItem.status === 'processing') return;
 
-    setFiles(prev => prev.map(f => f.id === id ? { ...f, status: 'processing', progress: 10 } : f));
+    if (fileItem.file.type === 'image/gif') {
+      setFiles(prev => prev.map(f => f.id === id ? { ...f, status: 'processing', progress: 0, startTime: Date.now() } : f));
+      await processGif(id, fileItem.file);
+      return;
+    }
+
+    setFiles(prev => prev.map(f => f.id === id ? { ...f, status: 'processing', progress: 10, startTime: Date.now() } : f));
 
     try {
+      const startTime = Date.now();
       const blob = await removeBackground(fileItem.file, {
         progress: (p: any) => {
            setFiles(prev => prev.map(f => f.id === id ? { ...f, progress: Math.round((p as number) * 100) } : f));
         }
       });
+      const endTime = Date.now();
+      const duration = (endTime - startTime) / 1000;
+      const speed = duration / (fileItem.file.size / 1024 / 1024);
+      setAvgSpeed(prev => prev ? (prev * 0.7 + speed * 0.3) : speed);
+
       const url = URL.createObjectURL(blob);
       setFiles(prev => prev.map(f => f.id === id ? { ...f, processedUrl: url, status: 'done', progress: 100 } : f));
     } catch (err) {
@@ -869,7 +1025,7 @@ export default function App() {
     if (!fileItem.processedUrl) return;
     const link = document.createElement('a');
     link.href = fileItem.processedUrl;
-    link.download = `${fileItem.file.name.split('.')[0]}_no_bg.png`;
+    link.download = `${fileItem.file.name.split('.')[0]}_no_bg.${fileItem.file.type === 'image/gif' ? 'gif' : 'png'}`;
     link.click();
   };
 
@@ -886,7 +1042,7 @@ export default function App() {
     for (const file of doneFiles) {
       const response = await fetch(file.processedUrl!);
       const blob = await response.blob();
-      zip.file(`${file.file.name.split('.')[0]}_no_bg.png`, blob);
+      zip.file(`${file.file.name.split('.')[0]}_no_bg.${file.file.type === 'image/gif' ? 'gif' : 'png'}`, blob);
     }
 
     const content = await zip.generateAsync({ type: 'blob' });
@@ -916,9 +1072,24 @@ export default function App() {
         </div>
         <div className="hidden md:flex items-center gap-8 text-sm font-medium text-gray-500">
           <a href="#" className="text-black">Remover</a>
-          <a href="#" className="hover:text-black transition-colors">How it works</a>
-          <a href="#" className="hover:text-black transition-colors">Privacy</a>
-          <a href="#" className="px-5 py-2 bg-gray-900 text-white rounded-full hover:bg-black transition-all font-bold">Free Forever</a>
+          <button 
+            onClick={() => setShowInfoSidebar(true)}
+            className="hover:text-black transition-colors"
+          >
+            How it works
+          </button>
+          <button 
+            onClick={() => setShowInfoSidebar(true)}
+            className="hover:text-black transition-colors"
+          >
+            Privacy
+          </button>
+          <button 
+            onClick={() => setShowInfoSidebar(true)}
+            className="px-5 py-2 bg-gray-900 text-white rounded-full hover:bg-black transition-all font-bold"
+          >
+            Info
+          </button>
         </div>
       </nav>
 
@@ -957,14 +1128,14 @@ export default function App() {
               type="file" 
               multiple 
               className="hidden" 
-              accept="image/*"
+              accept="image/*,.gif"
               onChange={onFileChange}
             />
             <div className="w-16 h-16 bg-white rounded-2xl shadow-sm flex items-center justify-center mb-6 group-hover:scale-110 transition-transform duration-300">
               <Upload className="w-8 h-8 text-blue-600" />
             </div>
             <h3 className="text-xl font-semibold text-gray-900">Drop files here or click to upload</h3>
-            <p className="text-gray-400 text-sm mt-2 uppercase tracking-widest font-bold">PNG, JPG, WebP up to 10MB</p>
+            <p className="text-gray-400 text-sm mt-2 uppercase tracking-widest font-bold">PNG, JPG, GIF, WebP up to 10MB</p>
           </motion.div>
         ) : (
           <div className="w-full max-w-4xl animate-in fade-in slide-in-from-bottom-4 duration-700">
@@ -978,7 +1149,7 @@ export default function App() {
                 >
                   <Plus className="w-3.5 h-3.5 stroke-[3]" /> Add More
                 </button>
-                <input id="file-upload-more" type="file" multiple className="hidden" accept="image/*" onChange={onFileChange} />
+                <input id="file-upload-more" type="file" multiple className="hidden" accept="image/*,.gif" onChange={onFileChange} />
               </div>
               <div className="flex items-center gap-3 w-full md:w-auto">
                 <button 
@@ -1043,8 +1214,21 @@ export default function App() {
                         {file.status === 'processing' && (
                           <div className="absolute inset-0 flex flex-col items-center justify-center gap-3">
                             <div className="w-8 h-8 border-[3px] border-blue-600 border-t-transparent rounded-full animate-spin" />
-                            <div className="bg-white/80 px-2 py-0.5 rounded-full">
+                            <div className="bg-white/80 px-2 py-0.5 rounded-full text-center">
                                <p className="text-[10px] font-black text-blue-600 tracking-tighter">{file.progress}%</p>
+                               {file.file.type === 'image/gif' ? (
+                                 avgFrameSpeed && file.totalFrames && (
+                                   <p className="text-[8px] font-bold text-gray-400 uppercase tracking-tight mt-0.5">
+                                     {formatDuration(Math.max(1, (avgFrameSpeed * file.totalFrames * (1 - file.progress / 100))))} left
+                                   </p>
+                                 )
+                               ) : (
+                                 avgSpeed && (
+                                   <p className="text-[8px] font-bold text-gray-400 uppercase tracking-tight mt-0.5">
+                                     {formatDuration(Math.max(1, (avgSpeed * (file.file.size / 1024 / 1024)) * (1 - file.progress / 100)))} left
+                                   </p>
+                                 )
+                               )}
                             </div>
                           </div>
                         )}
@@ -1059,17 +1243,19 @@ export default function App() {
                           </button>
                           {file.status === 'done' ? (
                              <>
-                               <button 
-                                 onClick={() => setEditingFileId(file.id)}
-                                 className="flex-1 bg-white/90 backdrop-blur text-gray-900 border border-gray-100 font-bold text-xs py-2 rounded-lg shadow-sm hover:bg-white transition-colors flex items-center justify-center gap-1.5"
-                               >
-                                 <Edit2 className="w-3.5 h-3.5 text-blue-600" /> Refine
-                               </button>
+                               {file.file.type !== 'image/gif' && (
+                                 <button 
+                                   onClick={() => setEditingFileId(file.id)}
+                                   className="flex-1 bg-white/90 backdrop-blur text-gray-900 border border-gray-100 font-bold text-xs py-2 rounded-lg shadow-sm hover:bg-white transition-colors flex items-center justify-center gap-1.5"
+                                 >
+                                   <Edit2 className="w-3.5 h-3.5 text-blue-600" /> Refine
+                                 </button>
+                               )}
                                <button 
                                  onClick={() => downloadFile(file)}
-                                 className="p-2 bg-white/90 backdrop-blur text-blue-600 border border-gray-100 rounded-lg shadow-sm hover:bg-white transition-colors"
+                                 className={`p-2 bg-white/90 backdrop-blur text-blue-600 border border-gray-100 rounded-lg shadow-sm hover:bg-white transition-colors ${file.file.type === 'image/gif' ? 'flex-1 flex items-center justify-center gap-2' : ''}`}
                                >
-                                 <Download className="w-4 h-4" />
+                                 <Download className="w-4 h-4" /> {file.file.type === 'image/gif' ? 'Download' : ''}
                                </button>
                              </>
                           ) : (
@@ -1102,6 +1288,22 @@ export default function App() {
                               file.status === 'error' ? 'Failed' : 'Pending'}
                            </p>
                         </div>
+                        {file.file.type === 'image/gif' && file.status === 'pending' && (
+                          <div className="mt-3 pt-3 border-t border-gray-50">
+                            <label className="text-[9px] font-black uppercase tracking-widest text-gray-400 block mb-2">Target FPS: {file.gifFps}</label>
+                            <input 
+                              type="range"
+                              min="1"
+                              max="30"
+                              value={file.gifFps}
+                              onChange={(e) => {
+                                const fps = parseInt(e.target.value);
+                                setFiles(prev => prev.map(f => f.id === file.id ? { ...f, gifFps: fps } : f));
+                              }}
+                              className="w-full accent-blue-600 h-1"
+                            />
+                          </div>
+                        )}
                       </div>
                     </div>
                   </motion.div>
@@ -1113,6 +1315,94 @@ export default function App() {
       </main>
 
       <AnimatePresence>
+        {showInfoSidebar && (
+          <>
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setShowInfoSidebar(false)}
+              className="fixed inset-0 bg-black/20 backdrop-blur-sm z-[150]"
+            />
+            <motion.div 
+              initial={{ x: '100%' }}
+              animate={{ x: 0 }}
+              exit={{ x: '100%' }}
+              transition={{ type: 'spring', damping: 25, stiffness: 200 }}
+              className="fixed top-0 right-0 bottom-0 w-80 md:w-96 bg-white z-[160] shadow-2xl flex flex-col"
+            >
+              <div className="h-16 px-8 border-b border-gray-100 flex items-center justify-between shrink-0">
+                <h2 className="font-bold tracking-tight text-lg text-gray-900">Information</h2>
+                <button 
+                  onClick={() => setShowInfoSidebar(false)}
+                  className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
+                >
+                  <X className="w-5 h-5 text-gray-400" />
+                </button>
+              </div>
+              
+              <div className="flex-1 overflow-y-auto p-8 space-y-10">
+                <section>
+                  <div className="w-10 h-10 bg-blue-50 rounded-xl flex items-center justify-center mb-4">
+                    <Layers className="w-5 h-5 text-blue-600" />
+                  </div>
+                  <h3 className="font-bold text-gray-900 mb-2 tracking-tight">How it works</h3>
+                  <p className="text-sm text-gray-500 leading-relaxed">
+                    GhostBG uses state-of-the-art AI models executed directly in your browser. 
+                    When you upload an image, the background detection runs locally on your device, 
+                    ensuring maximum speed and absolute privacy.
+                  </p>
+                </section>
+
+                <section>
+                  <div className="w-10 h-10 bg-green-50 rounded-xl flex items-center justify-center mb-4">
+                    <CheckCircle2 className="w-5 h-5 text-green-600" />
+                  </div>
+                  <h3 className="font-bold text-gray-900 mb-2 tracking-tight">Privacy First</h3>
+                  <p className="text-sm text-gray-500 leading-relaxed">
+                    Unlike other services, your photos <span className="text-black font-semibold">never leave your device</span>. 
+                    Every pixel stays on your hardware. We don't see your images, we don't store them, 
+                    and we certainly don't use them for training.
+                  </p>
+                </section>
+
+                <section>
+                  <div className="w-10 h-10 bg-purple-50 rounded-xl flex items-center justify-center mb-4">
+                    <CheckCircle2 className="w-5 h-5 text-purple-600" />
+                  </div>
+                  <h3 className="font-bold text-gray-900 mb-2 tracking-tight">Free Forever</h3>
+                  <p className="text-sm text-gray-500 leading-relaxed text-balance">
+                    High-quality background removal shouldn't be a luxury. We provide the full toolset 
+                    including batch processing and manual refinement completely free of charge.
+                  </p>
+                </section>
+                
+                <section className="bg-gray-50 rounded-2xl p-6">
+                  <h4 className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-4">Hardware Info</h4>
+                  <div className="space-y-3">
+                    <div className="flex justify-between items-center text-xs">
+                      <span className="text-gray-500">Acceleration</span>
+                      <span className="font-bold text-blue-600">{hardwareInfo.tech}</span>
+                    </div>
+                    <div className="flex justify-between items-center text-xs">
+                      <span className="text-gray-500">Performance</span>
+                      <span className="font-bold text-gray-900">{hardwareInfo.capability}</span>
+                    </div>
+                    <div className="flex justify-between items-center text-xs">
+                      <span className="text-gray-500">Browser API</span>
+                      <span className="font-bold text-gray-900">{typeof window !== 'undefined' && 'SharedArrayBuffer' in window ? 'SIMD Active' : 'Fallback'}</span>
+                    </div>
+                  </div>
+                </section>
+              </div>
+              
+              <div className="p-8 border-t border-gray-100 italic text-[10px] text-gray-400">
+                Created with precision. No servers, no tracking.
+              </div>
+            </motion.div>
+          </>
+        )}
+
         {currentEditingFile && (
           <MaskEditor 
             key={`editor-${currentEditingFile.id}`}
@@ -1148,11 +1438,14 @@ export default function App() {
         <div className="flex flex-col md:flex-row gap-4 md:gap-10 text-center md:text-left">
           <span>Files deleted after session</span>
           <span>Private: Processing happens in your browser</span>
+          <div className="flex items-center gap-2">
+            <span className="text-blue-600 border border-blue-100 bg-blue-50 px-2 py-0.5 rounded">Speed Boost: {hardwareInfo.tech}</span>
+          </div>
         </div>
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-1.5 px-3 py-1 bg-green-50 text-green-600 rounded-full border border-green-100">
             <div className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse"></div>
-            <span>System Status: Optimal</span>
+            <span>Estimated Speed: {hardwareInfo.capability}</span>
           </div>
         </div>
       </footer>
