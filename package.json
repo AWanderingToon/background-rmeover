@@ -17,6 +17,7 @@
     "@vitejs/plugin-react": "^5.0.4",
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
+    "gif-encoder-2": "^1.0.5",
     "gifshot": "^0.4.5",
     "gifuct-js": "^2.1.2",
     "jszip": "^3.10.1",

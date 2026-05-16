@@ -26,7 +26,9 @@ import {
   Wand2,
   MousePointer2,
   ChevronLeft,
-  ChevronRight
+  ChevronRight,
+  Settings,
+  Maximize
 } from 'lucide-react';
 import { removeBackground } from '@imgly/background-removal';
 import JSZip from 'jszip';
@@ -36,12 +38,20 @@ import gifshot from 'gifshot';
 
 // --- Types ---
 
+interface GifFrame {
+  originalBlob: Blob;
+  previewUrl: string;
+  processedUrl: string | null;
+  maskUrl: string | null;
+  delay: number;
+}
+
 interface ProcessedFile {
   id: string;
   file: File;
   preview: string;
   processedUrl: string | null;
-  maskUrl: string | null; // Added to store the refinement mask
+  maskUrl: string | null; 
   status: 'pending' | 'processing' | 'done' | 'error';
   error?: string;
   progress: number;
@@ -49,13 +59,14 @@ interface ProcessedFile {
   estimatedSeconds?: number;
   gifFps?: number;
   totalFrames?: number;
+  gifFrames?: GifFrame[]; // Added for frame-by-frame editing
 }
 
 // --- MaskEditor Component ---
 
 interface MaskEditorProps {
   fileItem: ProcessedFile;
-  onSave: (processedUrl: string) => void;
+  onSave: (processedUrl: string, gifFrames?: GifFrame[]) => void;
   onClose: () => void;
 }
 
@@ -76,11 +87,20 @@ const MaskEditor: React.FC<MaskEditorProps> = ({ fileItem, onSave, onClose }) =>
   const [mousePos, setMousePos] = useState({ x: -100, y: -100 });
   const [isMouseOver, setIsMouseOver] = useState(false);
   const [lastPanPos, setLastPanPos] = useState({ x: 0, y: 0 });
+  
+  // GIF specific state
+  const [currentFrameIdx, setCurrentFrameIdx] = useState(0);
+  const [gifFrames, setGifFrames] = useState<GifFrame[]>(fileItem.gifFrames || []);
+  const [isPlaying, setIsPlaying] = useState(false);
 
   useEffect(() => {
     const setupCanvases = async () => {
+      setIsLoading(true);
+      const isGif = !!fileItem.gifFrames;
+      const currentFrame = isGif ? gifFrames[currentFrameIdx] : null;
+      
       const img = new Image();
-      img.src = fileItem.preview;
+      img.src = isGif ? currentFrame!.previewUrl : fileItem.preview;
       await new Promise(resolve => img.onload = resolve);
 
       const canvas = canvasRef.current;
@@ -99,11 +119,14 @@ const MaskEditor: React.FC<MaskEditorProps> = ({ fileItem, onSave, onClose }) =>
 
       ctx.drawImage(img, 0, 0);
 
-      if (fileItem.processedUrl) {
+      const processedUrl = isGif ? currentFrame!.processedUrl : fileItem.processedUrl;
+
+      if (processedUrl) {
         const resultImg = new Image();
-        resultImg.src = fileItem.processedUrl;
+        resultImg.src = processedUrl;
         await new Promise(resolve => resultImg.onload = resolve);
         
+        maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
         maskCtx.drawImage(resultImg, 0, 0);
         const imgData = maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
         for (let i = 0; i < imgData.data.length; i += 4) {
@@ -123,7 +146,29 @@ const MaskEditor: React.FC<MaskEditorProps> = ({ fileItem, onSave, onClose }) =>
     };
 
     setupCanvases();
-  }, [fileItem]);
+  }, [fileItem, currentFrameIdx]);
+
+  // Handle frame changes: save current mask to the frame list before switching
+  const saveCurrentMaskToFrame = () => {
+    if (!fileItem.gifFrames) return;
+    
+    const canvas = document.createElement('canvas');
+    const mask = maskCanvasRef.current;
+    const originalCanvas = canvasRef.current;
+    if (!mask || !originalCanvas) return;
+
+    canvas.width = originalCanvas.width;
+    canvas.height = originalCanvas.height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    ctx.drawImage(originalCanvas, 0, 0);
+    ctx.globalCompositeOperation = 'destination-in';
+    ctx.drawImage(mask, 0, 0);
+    
+    const processedUrl = canvas.toDataURL('image/png');
+    setGifFrames(prev => prev.map((f, i) => i === currentFrameIdx ? { ...f, processedUrl } : f));
+  };
 
   // Main rendering loop for the display canvas
   useEffect(() => {
@@ -396,8 +441,25 @@ const MaskEditor: React.FC<MaskEditorProps> = ({ fileItem, onSave, onClose }) =>
     ctx.globalCompositeOperation = 'destination-in';
     ctx.drawImage(mask, 0, 0);
     
-    onSave(canvas.toDataURL('image/png'));
+    const currentProcessedUrl = canvas.toDataURL('image/png');
+
+    if (fileItem.gifFrames) {
+      const updatedFrames = gifFrames.map((f, i) => i === currentFrameIdx ? { ...f, processedUrl: currentProcessedUrl } : f);
+      onSave(fileItem.processedUrl || '', updatedFrames);
+    } else {
+      onSave(currentProcessedUrl);
+    }
   };
+
+  useEffect(() => {
+    let interval: any;
+    if (isPlaying && fileItem.gifFrames) {
+      interval = setInterval(() => {
+        setCurrentFrameIdx(prev => (prev + 1) % gifFrames.length);
+      }, 1000 / (fileItem.gifFps || 10));
+    }
+    return () => clearInterval(interval);
+  }, [isPlaying, fileItem.gifFps, gifFrames.length]);
 
   return (
     <motion.div 
@@ -416,7 +478,7 @@ const MaskEditor: React.FC<MaskEditorProps> = ({ fileItem, onSave, onClose }) =>
             <X className="w-5 h-5" />
           </button>
           <div className="h-6 w-px bg-gray-200" />
-          <h2 className="font-bold tracking-tight text-gray-900 truncate max-w-[200px]">{fileItem.file.name}</h2>
+          <h2 className="font-bold tracking-tight text-gray-900 truncate max-w-[200px]">{fileItem.file.name} {fileItem.gifFrames && `(Frame ${currentFrameIdx + 1}/${gifFrames.length})`}</h2>
         </div>
 
         <div className="flex items-center gap-2 p-1 bg-gray-100 rounded-xl">
@@ -463,14 +525,14 @@ const MaskEditor: React.FC<MaskEditorProps> = ({ fileItem, onSave, onClose }) =>
           </button>
           <button 
             onClick={handleSave}
-            className="px-6 py-2 bg-blue-600 text-white rounded-lg text-sm font-bold hover:bg-blue-700 transition-colors shadow-sm"
+            className="px-6 py-2 bg-blue-600 text-white rounded-lg text-sm font-bold hover:bg-blue-700 transition-colors shadow-sm underline"
           >
-            Finished
+            Save Changes
           </button>
         </div>
       </div>
 
-      <div className="flex-1 flex overflow-hidden bg-gray-50">
+      <div className="flex-1 flex overflow-hidden bg-gray-50 relative">
         <div className="w-64 border-r border-gray-100 bg-white p-6 flex flex-col gap-8 overflow-y-auto">
           {tool === 'magic' ? (
             <section className="animate-in fade-in zoom-in-95 duration-200">
@@ -532,7 +594,32 @@ const MaskEditor: React.FC<MaskEditorProps> = ({ fileItem, onSave, onClose }) =>
             </div>
           </section>
 
-          <section className="mt-8 pt-8 border-t border-gray-50">
+          {fileItem.gifFrames && (
+             <section className="mt-4 pt-4 border-t border-gray-50">
+               <label className="text-[10px] font-black uppercase tracking-[0.2em] text-gray-400 block mb-4">Playback Speed</label>
+               <input 
+                  type="range" 
+                  min="1" 
+                  max="30" 
+                  value={fileItem.gifFps} 
+                  onChange={(e) => {
+                    // This logic should probably be handled in parent, 
+                    // but for now we just allow playback speed adjustment in preview
+                  }}
+                  className="w-full accent-blue-600 h-1"
+                />
+                <div className="flex justify-center mt-4">
+                  <button 
+                    onClick={() => setIsPlaying(!isPlaying)}
+                    className={`px-6 py-2 rounded-xl font-bold flex items-center gap-2 text-xs transition-all ${isPlaying ? 'bg-red-50 text-red-600' : 'bg-blue-50 text-blue-600'}`}
+                  >
+                    {isPlaying ? 'Pause' : 'Play Preview'}
+                  </button>
+                </div>
+             </section>
+          )}
+
+          <section className="mt-auto pt-8 border-t border-gray-50">
              <h4 className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-2">Controls</h4>
              <ul className="text-[10px] font-bold text-gray-400 space-y-2 uppercase tracking-wider">
                <li className="flex items-center gap-2"><div className="w-4 h-4 bg-gray-100 rounded flex items-center justify-center text-[8px]"><MousePointer2 className="w-2 h-2" /></div> Middle Click to Pan</li>
@@ -542,27 +629,50 @@ const MaskEditor: React.FC<MaskEditorProps> = ({ fileItem, onSave, onClose }) =>
           </section>
         </div>
 
-        <div className="flex-1 relative overflow-auto p-12 flex items-center justify-center select-none bg-gray-100/50">
-          <div 
-            className={`relative shadow-2xl transition-all duration-300 ${
-              bgPreview === 'checker' ? 'bg-transparency' : bgPreview === 'white' ? 'bg-white' : 'bg-black'
-            }`}
-             onMouseEnter={() => setIsMouseOver(true)}
-             onMouseLeave={() => { setIsMouseOver(false); setIsDrawing(false); setIsPanning(false); }}
-          >
-            <canvas ref={canvasRef} className="hidden" />
-            <canvas ref={maskCanvasRef} className="hidden" />
-            <canvas
-              ref={displayCanvasRef}
-              className={`max-w-full max-h-[75vh] w-auto h-auto block ${isPanning ? 'cursor-grabbing' : 'cursor-none'}`}
-              onMouseDown={handleStart}
-              onMouseMove={draw}
-              onMouseUp={() => { setIsDrawing(false); setIsPanning(false); }}
-              onTouchStart={handleStart}
-              onTouchMove={draw}
-              onTouchEnd={() => { setIsDrawing(false); setIsPanning(false); }}
-            />
+        <div className="flex-1 relative flex flex-col">
+          <div className="flex-1 flex items-center justify-center select-none bg-gray-50 p-12">
+            <div 
+              className={`relative shadow-2xl transition-all duration-300 ${
+                bgPreview === 'checker' ? 'bg-transparency' : bgPreview === 'white' ? 'bg-white' : 'bg-black'
+              }`}
+               onMouseEnter={() => setIsMouseOver(true)}
+               onMouseLeave={() => { setIsMouseOver(false); setIsDrawing(false); setIsPanning(false); }}
+            >
+              <canvas ref={canvasRef} className="hidden" />
+              <canvas ref={maskCanvasRef} className="hidden" />
+              <canvas
+                ref={displayCanvasRef}
+                className={`max-w-full max-h-[75vh] w-auto h-auto block ${isPanning ? 'cursor-grabbing' : 'cursor-none'}`}
+                onMouseDown={handleStart}
+                onMouseMove={draw}
+                onMouseUp={() => { setIsDrawing(false); setIsPanning(false); }}
+                onTouchStart={handleStart}
+                onTouchMove={draw}
+                onTouchEnd={() => { setIsDrawing(false); setIsPanning(false); }}
+              />
+              
+              {isLoading && (
+                <div className="absolute inset-0 bg-white/50 backdrop-blur-sm flex items-center justify-center">
+                  <Loader2 className="w-8 h-8 text-blue-600 animate-spin" />
+                </div>
+              )}
+            </div>
           </div>
+          
+          {fileItem.gifFrames && (
+            <div className="h-32 bg-white border-t border-gray-100 p-4 flex gap-4 overflow-x-auto scrollbar-hide">
+              {gifFrames.map((frame, idx) => (
+                <button 
+                  key={idx}
+                  onClick={() => { saveCurrentMaskToFrame(); setCurrentFrameIdx(idx); }}
+                  className={`w-20 h-20 shrink-0 border-4 rounded-xl overflow-hidden transition-all relative group ${currentFrameIdx === idx ? 'border-blue-600 scale-105 z-10' : 'border-transparent opacity-60 hover:opacity-100'}`}
+                >
+                  <img src={frame.processedUrl || frame.previewUrl} className="w-full h-full object-cover" />
+                  <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 flex items-center justify-center text-[10px] text-white font-black">{idx + 1}</div>
+                </button>
+              ))}
+            </div>
+          )}
         </div>
       </div>
     </motion.div>
@@ -808,6 +918,12 @@ export default function App() {
   const [hardwareInfo, setHardwareInfo] = useState<{ capability: 'High' | 'Medium' | 'Standard', tech: string }>({ capability: 'Standard', tech: 'WASM' });
   const [avgSpeed, setAvgSpeed] = useState<number | null>(null); // seconds per MB
   const [showInfoSidebar, setShowInfoSidebar] = useState(false);
+  const [sidebarTab, setSidebarTab] = useState<'info' | 'settings'>('info');
+  const [settings, setSettings] = useState({
+    enforceResolution: false,
+    targetWidth: 1080,
+    targetHeight: 1080
+  });
   const [avgFrameSpeed, setAvgFrameSpeed] = useState<number | null>(null); // seconds per frame for GIFs
 
   useEffect(() => {
@@ -875,109 +991,178 @@ export default function App() {
   const processGif = async (id: string, file: File) => {
     const startProcessTime = Date.now();
     const fileItem = files.find(f => f.id === id);
-    const targetFps = fileItem?.gifFps || 10;
+    if (!fileItem) return;
+    const targetFps = fileItem.gifFps || 10;
     
     try {
       const buffer = await file.arrayBuffer();
       const gif = parseGIF(buffer);
       const frames = decompressFrames(gif, true);
       
+      const width = gif.lsd.width;
+      const height = gif.lsd.height;
+
+      if (settings.enforceResolution && (width < settings.targetWidth || height < settings.targetHeight)) {
+        setFiles(prev => prev.map(f => f.id === id ? { 
+          ...f, 
+          status: 'error', 
+          error: `Minimum resolution requirement not met (${settings.targetWidth}x${settings.targetHeight} required, got ${width}x${height})` 
+        } : f));
+        return;
+      }
+
+      // 1. Reconstruct all frames to avoid skipping partial updates distortion
+      const fullFrameBlobs: { blob: Blob, delay: number }[] = [];
+      const renderCanvas = document.createElement('canvas');
+      
+      const finalWidth = settings.enforceResolution ? settings.targetWidth : width;
+      const finalHeight = settings.enforceResolution ? settings.targetHeight : height;
+      
+      renderCanvas.width = width;
+      renderCanvas.height = height;
+      const rCtx = renderCanvas.getContext('2d', { willReadFrequently: true })!;
+
+      setFiles(prev => prev.map(f => f.id === id ? { ...f, status: 'processing', progress: 5 } : f));
+
+      let lastImageData: ImageData | null = null;
+
+      for (let i = 0; i < frames.length; i++) {
+        const frame = frames[i];
+        
+        if (i > 0) {
+          const prevFrame = frames[i - 1];
+          if (prevFrame.disposalType === 2) {
+            rCtx.clearRect(prevFrame.dims.left, prevFrame.dims.top, prevFrame.dims.width, prevFrame.dims.height);
+          } else if (prevFrame.disposalType === 3 && lastImageData) {
+            rCtx.putImageData(lastImageData, 0, 0);
+          }
+        }
+
+        if (frame.disposalType === 3) {
+          lastImageData = rCtx.getImageData(0, 0, width, height);
+        }
+
+        if (frame.patch) {
+          const patchData = new ImageData(new Uint8ClampedArray(frame.patch), frame.dims.width, frame.dims.height);
+          const patchCanvas = document.createElement('canvas');
+          patchCanvas.width = frame.dims.width;
+          patchCanvas.height = frame.dims.height;
+          patchCanvas.getContext('2d')!.putImageData(patchData, 0, 0);
+          rCtx.drawImage(patchCanvas, frame.dims.left, frame.dims.top);
+        }
+        
+        let targetBlob: Blob;
+        if (settings.enforceResolution) {
+          const cropCanvas = document.createElement('canvas');
+          cropCanvas.width = settings.targetWidth;
+          cropCanvas.height = settings.targetHeight;
+          const cCtx = cropCanvas.getContext('2d')!;
+          
+          const scale = Math.max(cropCanvas.width / width, cropCanvas.height / height);
+          const x = (cropCanvas.width / scale - width) / 2;
+          const y = (cropCanvas.height / scale - height) / 2;
+          cCtx.scale(scale, scale);
+          cCtx.drawImage(renderCanvas, x, y);
+          targetBlob = await new Promise<Blob>(res => cropCanvas.toBlob(b => res(b!), 'image/png'));
+        } else {
+          targetBlob = await new Promise<Blob>(res => renderCanvas.toBlob(b => res(b!), 'image/png'));
+        }
+        
+        fullFrameBlobs.push({ blob: targetBlob!, delay: frame.delay || 100 });
+      }
+
+      // 2. Sample frames based on target FPS
       const originalDelay = frames[0].delay || 100;
       const originalFps = 1000 / originalDelay;
-      
-      // Calculate how many frames to skip to match target FPS
       const skipFactor = Math.max(1, Math.round(originalFps / targetFps));
-      const targetFrames = frames.filter((_, idx) => idx % skipFactor === 0);
+      const targetFrames = fullFrameBlobs.filter((_, idx) => idx % skipFactor === 0);
       
       const totalFrames = targetFrames.length;
       setFiles(prev => prev.map(f => f.id === id ? { ...f, totalFrames } : f));
-      const processedFrameUrls: string[] = [];
 
-      // Create a temporary canvas to extract frames
-      const tempCanvas = document.createElement('canvas');
-      const tempCtx = tempCanvas.getContext('2d');
-      if (!tempCtx) throw new Error('Could not create canvas context');
+      // 3. Concurrent processing of frames for speed
+      const processedGifFrames: GifFrame[] = new Array(totalFrames);
+      const concurrency = 3;
+      let completedCount = 0;
 
-      tempCanvas.width = targetFrames[0].dims.width;
-      tempCanvas.height = targetFrames[0].dims.height;
+      const processBatch = async (indices: number[]) => {
+        for (const idx of indices) {
+          const frameStartTime = Date.now();
+          
+          try {
+            const processedBlob = await removeBackground(targetFrames[idx].blob);
+            processedGifFrames[idx] = {
+              originalBlob: targetFrames[idx].blob,
+              previewUrl: URL.createObjectURL(targetFrames[idx].blob),
+              processedUrl: URL.createObjectURL(processedBlob),
+              maskUrl: null,
+              delay: targetFrames[idx].delay
+            };
+          } catch (e) {
+            processedGifFrames[idx] = {
+              originalBlob: targetFrames[idx].blob,
+              previewUrl: URL.createObjectURL(targetFrames[idx].blob),
+              processedUrl: URL.createObjectURL(targetFrames[idx].blob),
+              maskUrl: null,
+              delay: targetFrames[idx].delay
+            };
+          }
 
-      for (let i = 0; i < totalFrames; i++) {
-        const frame = targetFrames[i];
-        const frameStartTime = Date.now();
-        
-        // Update progress context
-        setFiles(prev => prev.map(f => f.id === id ? { 
-          ...f, 
-          status: 'processing', 
-          progress: Math.round(((i) / totalFrames) * 100) 
-        } : f));
-
-        // Create imageData from frame pixels
-        const imageData = new ImageData(
-          new Uint8ClampedArray(frame.patch),
-          frame.dims.width,
-          frame.dims.height
-        );
-
-        const frameCanvas = document.createElement('canvas');
-        frameCanvas.width = frame.dims.width;
-        frameCanvas.height = frame.dims.height;
-        const fCtx = frameCanvas.getContext('2d')!;
-        fCtx.putImageData(imageData, 0, 0);
-
-        // Convert to blob for background removal
-        const blob = await new Promise<Blob>((resolve) => frameCanvas.toBlob(b => resolve(b!), 'image/png'));
-        
-        // Remove background from this frame
-        const processedBlob = await removeBackground(blob);
-        const processedUrl = URL.createObjectURL(processedBlob);
-        processedFrameUrls.push(processedUrl);
-
-        const frameEndTime = Date.now();
-        const frameDuration = (frameEndTime - frameStartTime) / 1000;
-        setAvgFrameSpeed(prev => prev ? (prev * 0.9 + frameDuration * 0.1) : frameDuration);
-      }
-
-      setFiles(prev => prev.map(f => f.id === id ? { ...f, progress: 95 } : f));
-
-      // Re-encode with gifshot
-      gifshot.createGIF({
-        images: processedFrameUrls,
-        gifWidth: targetFrames[0].dims.width,
-        gifHeight: targetFrames[0].dims.height,
-        numFrames: totalFrames,
-        frameDuration: 10 / targetFps * 10, // gifshot frameDuration is in centiseconds (1/100s)
-        sampleInterval: 10,
-        transparent: '0x00FF00',
-      }, (obj: any) => {
-        // Revoke temporary frame URLs
-        processedFrameUrls.forEach(url => URL.revokeObjectURL(url));
-
-        if (!obj.error) {
-          const endProcessTime = Date.now();
-          const duration = (endProcessTime - startProcessTime) / 1000;
-          const speed = duration / (file.size / 1024 / 1024);
-          setAvgSpeed(prev => prev ? (prev * 0.7 + speed * 0.3) : speed);
+          completedCount++;
+          const frameEndTime = Date.now();
+          const frameDuration = (frameEndTime - frameStartTime) / 1000;
+          setAvgFrameSpeed(prev => prev ? (prev * 0.9 + frameDuration * 0.1) : frameDuration);
 
           setFiles(prev => prev.map(f => f.id === id ? { 
             ...f, 
-            processedUrl: obj.image, 
-            status: 'done', 
-            progress: 100 
-          } : f));
-        } else {
-          setFiles(prev => prev.map(f => f.id === id ? { 
-            ...f, 
-            status: 'error', 
-            error: 'Failed to re-encode GIF' 
+            progress: 10 + Math.round((completedCount / totalFrames) * 80) 
           } : f));
         }
-      });
+      };
+
+      const workerIndices = Array.from({ length: concurrency }, (_, i) => 
+        Array.from({ length: totalFrames }, (_, idx) => idx).filter(idx => idx % concurrency === i)
+      );
+
+      await Promise.all(workerIndices.map(processBatch));
+
+      // Initial encoding
+      const initialGifUrl = await encodeGif(processedGifFrames, finalWidth, finalHeight, targetFps);
+      
+      const endProcessTime = Date.now();
+      const duration = (endProcessTime - startProcessTime) / 1000;
+      const speed = duration / (file.size / 1024 / 1024);
+      setAvgSpeed(prev => prev ? (prev * 0.7 + speed * 0.3) : speed);
+
+      setFiles(prev => prev.map(f => f.id === id ? { 
+        ...f, 
+        gifFrames: processedGifFrames,
+        processedUrl: initialGifUrl, 
+        status: 'done', 
+        progress: 100 
+      } : f));
 
     } catch (err) {
       console.error(err);
-      setFiles(prev => prev.map(f => f.id === id ? { ...f, status: 'error', error: 'Failed to process GIF' } : f));
+      setFiles(prev => prev.map(f => f.id === id ? { ...f, status: 'error', error: 'Processing failed' } : f));
     }
+  };
+
+  const encodeGif = async (gifFrames: GifFrame[], width: number, height: number, fps: number): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      gifshot.createGIF({
+        images: gifFrames.map(f => f.processedUrl!),
+        gifWidth: width,
+        gifHeight: height,
+        numFrames: gifFrames.length,
+        frameDuration: (1000 / fps) / 10,
+        sampleInterval: 5, // Lower for better quality
+        transparent: '0x00FF00',
+      }, (obj: any) => {
+        if (obj.error) reject(obj.error);
+        else resolve(obj.image);
+      });
+    });
   };
 
   const processFile = async (id: string) => {
@@ -994,17 +1179,62 @@ export default function App() {
 
     try {
       const startTime = Date.now();
+
+      // Preliminary check if resolution enforcement is on
+      const img = new Image();
+      const fileUrl = URL.createObjectURL(fileItem.file);
+      img.src = fileUrl;
+      await new Promise(res => img.onload = res);
+      
+      if (settings.enforceResolution && (img.width < settings.targetWidth || img.height < settings.targetHeight)) {
+        setFiles(prev => prev.map(f => f.id === id ? { 
+          ...f, 
+          status: 'error', 
+          error: `Minimum resolution requirement not met (${settings.targetWidth}x${settings.targetHeight} required, got ${img.width}x${img.height})` 
+        } : f));
+        URL.revokeObjectURL(fileUrl);
+        return;
+      }
+      URL.revokeObjectURL(fileUrl);
+
       const blob = await removeBackground(fileItem.file, {
         progress: (p: any) => {
            setFiles(prev => prev.map(f => f.id === id ? { ...f, progress: Math.round((p as number) * 100) } : f));
         }
       });
+
+      let finalBlob = blob;
+
+      if (settings.enforceResolution) {
+        const processedImg = new Image();
+        const processedUrl = URL.createObjectURL(blob);
+        processedImg.src = processedUrl;
+        await new Promise(res => processedImg.onload = res);
+
+        const canvas = document.createElement('canvas');
+        canvas.width = settings.targetWidth;
+        canvas.height = settings.targetHeight;
+        const ctx = canvas.getContext('2d')!;
+        
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        
+        const scale = Math.max(canvas.width / processedImg.width, canvas.height / processedImg.height);
+        const x = (canvas.width / scale - processedImg.width) / 2;
+        const y = (canvas.height / scale - processedImg.height) / 2;
+        
+        ctx.scale(scale, scale);
+        ctx.drawImage(processedImg, x, y);
+        
+        finalBlob = await new Promise<Blob>(res => canvas.toBlob(b => res(b!), 'image/png'));
+        URL.revokeObjectURL(processedUrl);
+      }
+
       const endTime = Date.now();
       const duration = (endTime - startTime) / 1000;
       const speed = duration / (fileItem.file.size / 1024 / 1024);
       setAvgSpeed(prev => prev ? (prev * 0.7 + speed * 0.3) : speed);
 
-      const url = URL.createObjectURL(blob);
+      const url = URL.createObjectURL(finalBlob);
       setFiles(prev => prev.map(f => f.id === id ? { ...f, processedUrl: url, status: 'done', progress: 100 } : f));
     } catch (err) {
       console.error(err);
@@ -1054,9 +1284,37 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
-  const handleEditSave = (processedUrl: string) => {
+  const handleEditSave = async (processedUrl: string, gifFrames?: GifFrame[]) => {
     if (!editingFileId) return;
-    setFiles(prev => prev.map(f => f.id === editingFileId ? { ...f, processedUrl } : f));
+    
+    const fileItem = files.find(f => f.id === editingFileId);
+    if (!fileItem) return;
+
+    if (gifFrames) {
+      setFiles(prev => prev.map(f => f.id === editingFileId ? { ...f, status: 'processing', progress: 50, gifFrames } : f));
+      
+      try {
+        const width = gifFrames[0].processedUrl ? await new Promise<number>((res) => {
+          const img = new Image();
+          img.onload = () => res(img.width);
+          img.src = gifFrames[0].processedUrl!;
+        }) : 0;
+        
+        const height = gifFrames[0].processedUrl ? await new Promise<number>((res) => {
+          const img = new Image();
+          img.onload = () => res(img.height);
+          img.src = gifFrames[0].processedUrl!;
+        }) : 0;
+
+        const newGifUrl = await encodeGif(gifFrames, width, height, fileItem.gifFps || 10);
+        setFiles(prev => prev.map(f => f.id === editingFileId ? { ...f, processedUrl: newGifUrl, status: 'done', progress: 100 } : f));
+      } catch (err) {
+        console.error('Failed to re-encode GIF:', err);
+        setFiles(prev => prev.map(f => f.id === editingFileId ? { ...f, status: 'error', error: 'Re-encoding failed' } : f));
+      }
+    } else {
+      setFiles(prev => prev.map(f => f.id === editingFileId ? { ...f, processedUrl } : f));
+    }
     setEditingFileId(null);
   };
 
@@ -1073,22 +1331,22 @@ export default function App() {
         <div className="hidden md:flex items-center gap-8 text-sm font-medium text-gray-500">
           <a href="#" className="text-black">Remover</a>
           <button 
-            onClick={() => setShowInfoSidebar(true)}
+            onClick={() => { setSidebarTab('info'); setShowInfoSidebar(true); }}
             className="hover:text-black transition-colors"
           >
             How it works
           </button>
           <button 
-            onClick={() => setShowInfoSidebar(true)}
+            onClick={() => { setSidebarTab('info'); setShowInfoSidebar(true); }}
             className="hover:text-black transition-colors"
           >
             Privacy
           </button>
           <button 
-            onClick={() => setShowInfoSidebar(true)}
-            className="px-5 py-2 bg-gray-900 text-white rounded-full hover:bg-black transition-all font-bold"
+            onClick={() => { setSidebarTab('settings'); setShowInfoSidebar(true); }}
+            className="px-5 py-2 bg-gray-900 text-white rounded-full hover:bg-black transition-all font-bold flex items-center gap-2"
           >
-            Info
+            <Settings className="w-4 h-4" /> Settings
           </button>
         </div>
       </nav>
@@ -1243,14 +1501,12 @@ export default function App() {
                           </button>
                           {file.status === 'done' ? (
                              <>
-                               {file.file.type !== 'image/gif' && (
-                                 <button 
-                                   onClick={() => setEditingFileId(file.id)}
-                                   className="flex-1 bg-white/90 backdrop-blur text-gray-900 border border-gray-100 font-bold text-xs py-2 rounded-lg shadow-sm hover:bg-white transition-colors flex items-center justify-center gap-1.5"
-                                 >
-                                   <Edit2 className="w-3.5 h-3.5 text-blue-600" /> Refine
-                                 </button>
-                               )}
+                               <button 
+                                 onClick={() => setEditingFileId(file.id)}
+                                 className="flex-1 bg-white/90 backdrop-blur text-gray-900 border border-gray-100 font-bold text-xs py-2 rounded-lg shadow-sm hover:bg-white transition-colors flex items-center justify-center gap-1.5"
+                               >
+                                 <Edit2 className="w-3.5 h-3.5 text-blue-600" /> Refine
+                               </button>
                                <button 
                                  onClick={() => downloadFile(file)}
                                  className={`p-2 bg-white/90 backdrop-blur text-blue-600 border border-gray-100 rounded-lg shadow-sm hover:bg-white transition-colors ${file.file.type === 'image/gif' ? 'flex-1 flex items-center justify-center gap-2' : ''}`}
@@ -1332,7 +1588,20 @@ export default function App() {
               className="fixed top-0 right-0 bottom-0 w-80 md:w-96 bg-white z-[160] shadow-2xl flex flex-col"
             >
               <div className="h-16 px-8 border-b border-gray-100 flex items-center justify-between shrink-0">
-                <h2 className="font-bold tracking-tight text-lg text-gray-900">Information</h2>
+                <div className="flex gap-6">
+                  <button 
+                    onClick={() => setSidebarTab('info')}
+                    className={`font-bold tracking-tight text-lg transition-colors ${sidebarTab === 'info' ? 'text-gray-900' : 'text-gray-300 hover:text-gray-400'}`}
+                  >
+                    Information
+                  </button>
+                  <button 
+                    onClick={() => setSidebarTab('settings')}
+                    className={`font-bold tracking-tight text-lg transition-colors ${sidebarTab === 'settings' ? 'text-gray-900' : 'text-gray-300 hover:text-gray-400'}`}
+                  >
+                    Settings
+                  </button>
+                </div>
                 <button 
                   onClick={() => setShowInfoSidebar(false)}
                   className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
@@ -1341,59 +1610,117 @@ export default function App() {
                 </button>
               </div>
               
-              <div className="flex-1 overflow-y-auto p-8 space-y-10">
-                <section>
-                  <div className="w-10 h-10 bg-blue-50 rounded-xl flex items-center justify-center mb-4">
-                    <Layers className="w-5 h-5 text-blue-600" />
-                  </div>
-                  <h3 className="font-bold text-gray-900 mb-2 tracking-tight">How it works</h3>
-                  <p className="text-sm text-gray-500 leading-relaxed">
-                    GhostBG uses state-of-the-art AI models executed directly in your browser. 
-                    When you upload an image, the background detection runs locally on your device, 
-                    ensuring maximum speed and absolute privacy.
-                  </p>
-                </section>
+              <div className="flex-1 overflow-y-auto p-8">
+                {sidebarTab === 'info' ? (
+                  <div className="space-y-10 animate-in fade-in slide-in-from-right-4 duration-300">
+                    <section>
+                      <div className="w-10 h-10 bg-blue-50 rounded-xl flex items-center justify-center mb-4">
+                        <Layers className="w-5 h-5 text-blue-600" />
+                      </div>
+                      <h3 className="font-bold text-gray-900 mb-2 tracking-tight">How it works</h3>
+                      <p className="text-sm text-gray-500 leading-relaxed">
+                        GhostBG uses state-of-the-art AI models executed directly in your browser. 
+                        When you upload an image, the background detection runs locally on your device, 
+                        ensuring maximum speed and absolute privacy.
+                      </p>
+                    </section>
 
-                <section>
-                  <div className="w-10 h-10 bg-green-50 rounded-xl flex items-center justify-center mb-4">
-                    <CheckCircle2 className="w-5 h-5 text-green-600" />
-                  </div>
-                  <h3 className="font-bold text-gray-900 mb-2 tracking-tight">Privacy First</h3>
-                  <p className="text-sm text-gray-500 leading-relaxed">
-                    Unlike other services, your photos <span className="text-black font-semibold">never leave your device</span>. 
-                    Every pixel stays on your hardware. We don't see your images, we don't store them, 
-                    and we certainly don't use them for training.
-                  </p>
-                </section>
+                    <section>
+                      <div className="w-10 h-10 bg-green-50 rounded-xl flex items-center justify-center mb-4">
+                        <CheckCircle2 className="w-5 h-5 text-green-600" />
+                      </div>
+                      <h3 className="font-bold text-gray-900 mb-2 tracking-tight">Privacy First</h3>
+                      <p className="text-sm text-gray-500 leading-relaxed">
+                        Unlike other services, your photos <span className="text-black font-semibold">never leave your device</span>. 
+                        Every pixel stays on your hardware. We don't see your images, we don't store them, 
+                        and we certainly don't use them for training.
+                      </p>
+                    </section>
 
-                <section>
-                  <div className="w-10 h-10 bg-purple-50 rounded-xl flex items-center justify-center mb-4">
-                    <CheckCircle2 className="w-5 h-5 text-purple-600" />
+                    <section>
+                      <div className="w-10 h-10 bg-purple-50 rounded-xl flex items-center justify-center mb-4">
+                        <CheckCircle2 className="w-5 h-5 text-purple-600" />
+                      </div>
+                      <h3 className="font-bold text-gray-900 mb-2 tracking-tight">Free Forever</h3>
+                      <p className="text-sm text-gray-500 leading-relaxed text-balance">
+                        High-quality background removal shouldn't be a luxury. We provide the full toolset 
+                        including batch processing and manual refinement completely free of charge.
+                      </p>
+                    </section>
+                    
+                    <section className="bg-gray-50 rounded-2xl p-6">
+                      <h4 className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-4">Hardware Info</h4>
+                      <div className="space-y-3">
+                        <div className="flex justify-between items-center text-xs">
+                          <span className="text-gray-500">Acceleration</span>
+                          <span className="font-bold text-blue-600">{hardwareInfo.tech}</span>
+                        </div>
+                        <div className="flex justify-between items-center text-xs">
+                          <span className="text-gray-500">Performance</span>
+                          <span className="font-bold text-gray-900">{hardwareInfo.capability}</span>
+                        </div>
+                        <div className="flex justify-between items-center text-xs">
+                          <span className="text-gray-500">Browser API</span>
+                          <span className="font-bold text-gray-900">{typeof window !== 'undefined' && 'SharedArrayBuffer' in window ? 'SIMD Active' : 'Fallback'}</span>
+                        </div>
+                      </div>
+                    </section>
                   </div>
-                  <h3 className="font-bold text-gray-900 mb-2 tracking-tight">Free Forever</h3>
-                  <p className="text-sm text-gray-500 leading-relaxed text-balance">
-                    High-quality background removal shouldn't be a luxury. We provide the full toolset 
-                    including batch processing and manual refinement completely free of charge.
-                  </p>
-                </section>
-                
-                <section className="bg-gray-50 rounded-2xl p-6">
-                  <h4 className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-4">Hardware Info</h4>
-                  <div className="space-y-3">
-                    <div className="flex justify-between items-center text-xs">
-                      <span className="text-gray-500">Acceleration</span>
-                      <span className="font-bold text-blue-600">{hardwareInfo.tech}</span>
-                    </div>
-                    <div className="flex justify-between items-center text-xs">
-                      <span className="text-gray-500">Performance</span>
-                      <span className="font-bold text-gray-900">{hardwareInfo.capability}</span>
-                    </div>
-                    <div className="flex justify-between items-center text-xs">
-                      <span className="text-gray-500">Browser API</span>
-                      <span className="font-bold text-gray-900">{typeof window !== 'undefined' && 'SharedArrayBuffer' in window ? 'SIMD Active' : 'Fallback'}</span>
-                    </div>
+                ) : (
+                  <div className="space-y-10 animate-in fade-in slide-in-from-left-4 duration-300">
+                    <section>
+                      <h3 className="font-bold text-gray-900 mb-4 tracking-tight flex items-center gap-2">
+                        <Maximize className="w-5 h-5 text-blue-600" /> Resolution Settings
+                      </h3>
+                      <p className="text-xs text-gray-500 mb-6 leading-relaxed">
+                        Enforce a specific resolution for all processed images. This ensures consistency 
+                        for e-commerce listings or social media feeds.
+                      </p>
+                      
+                      <div className="space-y-6">
+                        <div className="flex items-center justify-between p-4 bg-gray-50 rounded-2xl">
+                          <div>
+                            <p className="font-bold text-sm text-gray-900">Enforce Resolution</p>
+                            <p className="text-[10px] text-gray-400 font-bold uppercase tracking-widest mt-1">Consistency Mode</p>
+                          </div>
+                          <button 
+                            onClick={() => setSettings(s => ({ ...s, enforceResolution: !s.enforceResolution }))}
+                            className={`w-12 h-6 rounded-full transition-colors relative ${settings.enforceResolution ? 'bg-blue-600' : 'bg-gray-200'}`}
+                          >
+                            <div className={`absolute top-1 w-4 h-4 rounded-full bg-white transition-all ${settings.enforceResolution ? 'left-7' : 'left-1'}`} />
+                          </button>
+                        </div>
+
+                        <div className={`space-y-4 transition-opacity duration-300 ${settings.enforceResolution ? 'opacity-100' : 'opacity-50 pointer-events-none'}`}>
+                          <div className="grid grid-cols-2 gap-4">
+                            <div className="space-y-2">
+                              <label className="text-[10px] font-black uppercase tracking-widest text-gray-400">Width (px)</label>
+                              <input 
+                                type="number" 
+                                value={settings.targetWidth}
+                                onChange={(e) => setSettings(s => ({ ...s, targetWidth: parseInt(e.target.value) || 0 }))}
+                                className="w-full bg-gray-50 border-none rounded-xl px-4 py-3 font-bold text-sm focus:ring-2 focus:ring-blue-600/20 transition-all"
+                              />
+                            </div>
+                            <div className="space-y-2">
+                              <label className="text-[10px] font-black uppercase tracking-widest text-gray-400">Height (px)</label>
+                              <input 
+                                type="number" 
+                                value={settings.targetHeight}
+                                onChange={(e) => setSettings(s => ({ ...s, targetHeight: parseInt(e.target.value) || 0 }))}
+                                className="w-full bg-gray-50 border-none rounded-xl px-4 py-3 font-bold text-sm focus:ring-2 focus:ring-blue-600/20 transition-all"
+                              />
+                            </div>
+                          </div>
+                          
+                          <p className="text-[10px] text-amber-600 bg-amber-50 p-3 rounded-lg border border-amber-100 leading-tight">
+                            <span className="font-black">NOTE:</span> Images smaller than the target resolution will be marked with an error to prevent blurry results.
+                          </p>
+                        </div>
+                      </div>
+                    </section>
                   </div>
-                </section>
+                )}
               </div>
               
               <div className="p-8 border-t border-gray-100 italic text-[10px] text-gray-400">
