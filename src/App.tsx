@@ -14,7 +14,15 @@ import {
   CheckCircle2, 
   AlertCircle,
   Plus,
-  Layers
+  Layers,
+  Edit2,
+  X,
+  Brush,
+  Eraser,
+  Square,
+  Maximize2,
+  RotateCcw,
+  Undo2
 } from 'lucide-react';
 import { removeBackground } from '@imgly/background-removal';
 import JSZip from 'jszip';
@@ -26,16 +34,483 @@ interface ProcessedFile {
   file: File;
   preview: string;
   processedUrl: string | null;
+  maskUrl: string | null; // Added to store the refinement mask
   status: 'pending' | 'processing' | 'done' | 'error';
   error?: string;
   progress: number;
 }
+
+// --- MaskEditor Component ---
+
+interface MaskEditorProps {
+  fileItem: ProcessedFile;
+  onSave: (processedUrl: string) => void;
+  onClose: () => void;
+}
+
+const MaskEditor: React.FC<MaskEditorProps> = ({ fileItem, onSave, onClose }) => {
+  const [brushSize, setBrushSize] = useState(30);
+  const [tool, setTool] = useState<'brush' | 'eraser'>('brush');
+  const [bgPreview, setBgPreview] = useState<'checker' | 'white' | 'black'>('checker');
+  const [showMaskOnly, setShowMaskOnly] = useState(false);
+  const canvasRef = React.useRef<HTMLCanvasElement>(null);
+  const maskCanvasRef = React.useRef<HTMLCanvasElement>(null);
+  const displayCanvasRef = React.useRef<HTMLCanvasElement>(null);
+  const [isDrawing, setIsDrawing] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const [mousePos, setMousePos] = useState({ x: -100, y: -100 });
+  const [isMouseOver, setIsMouseOver] = useState(false);
+
+  useEffect(() => {
+    const setupCanvases = async () => {
+      const img = new Image();
+      img.src = fileItem.preview;
+      await new Promise(resolve => img.onload = resolve);
+
+      const canvas = canvasRef.current;
+      const maskCanvas = maskCanvasRef.current;
+      const displayCanvas = displayCanvasRef.current;
+      if (!canvas || !maskCanvas || !displayCanvas) return;
+
+      [canvas, maskCanvas, displayCanvas].forEach(c => {
+        c.width = img.naturalWidth;
+        c.height = img.naturalHeight;
+      });
+
+      const ctx = canvas.getContext('2d');
+      const maskCtx = maskCanvas.getContext('2d');
+      if (!ctx || !maskCtx) return;
+
+      ctx.drawImage(img, 0, 0);
+
+      if (fileItem.processedUrl) {
+        const resultImg = new Image();
+        resultImg.src = fileItem.processedUrl;
+        await new Promise(resolve => resultImg.onload = resolve);
+        
+        maskCtx.drawImage(resultImg, 0, 0);
+        const imgData = maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
+        for (let i = 0; i < imgData.data.length; i += 4) {
+          const alpha = imgData.data[i + 3];
+          imgData.data[i] = 0;
+          imgData.data[i+1] = 0;
+          imgData.data[i+2] = 0;
+          imgData.data[i+3] = alpha;
+        }
+        maskCtx.putImageData(imgData, 0, 0);
+      } else {
+        maskCtx.fillStyle = 'black';
+        maskCtx.fillRect(0, 0, maskCanvas.width, maskCanvas.height);
+      }
+
+      setIsLoading(false);
+    };
+
+    setupCanvases();
+  }, [fileItem]);
+
+  // Main rendering loop for the display canvas
+  useEffect(() => {
+    if (isLoading) return;
+
+    let rafId: number;
+    const render = () => {
+      const display = displayCanvasRef.current;
+      const mask = maskCanvasRef.current;
+      const original = canvasRef.current;
+      if (!display || !mask || !original) return;
+
+      const dCtx = display.getContext('2d');
+      if (!dCtx) return;
+
+      dCtx.clearRect(0, 0, display.width, display.height);
+
+      if (showMaskOnly) {
+        // Just show the resulting cutout
+        dCtx.drawImage(original, 0, 0);
+        dCtx.globalCompositeOperation = 'destination-in';
+        dCtx.drawImage(mask, 0, 0);
+        dCtx.globalCompositeOperation = 'source-over';
+      } else {
+        // Show original with tinted mask overlay
+        dCtx.drawImage(original, 0, 0);
+        
+        // Use a temporary canvas to create the red tint
+        const tempCanvas = document.createElement('canvas');
+        tempCanvas.width = display.width;
+        tempCanvas.height = display.height;
+        const tCtx = tempCanvas.getContext('2d');
+        if (tCtx) {
+          tCtx.drawImage(mask, 0, 0);
+          tCtx.globalCompositeOperation = 'source-in';
+          tCtx.fillStyle = 'rgba(59, 130, 246, 0.4)'; // Blue tint for "kept" area
+          tCtx.fillRect(0, 0, tempCanvas.width, tempCanvas.height);
+          dCtx.drawImage(tempCanvas, 0, 0);
+        }
+      }
+
+      // Draw cursor
+      if (isMouseOver && !isLoading) {
+        const rect = display.getBoundingClientRect();
+        const scaleX = display.width / rect.width;
+        
+        dCtx.beginPath();
+        dCtx.arc(mousePos.x, mousePos.y, (brushSize / 2) * scaleX * (rect.width / display.width), 0, Math.PI * 2);
+        dCtx.strokeStyle = 'white';
+        dCtx.lineWidth = 2;
+        dCtx.stroke();
+        dCtx.strokeStyle = 'black';
+        dCtx.lineWidth = 1;
+        dCtx.stroke();
+      }
+
+      rafId = requestAnimationFrame(render);
+    };
+
+    render();
+    return () => cancelAnimationFrame(rafId);
+  }, [isLoading, mousePos, brushSize, isMouseOver, showMaskOnly]);
+
+  const getCoordinates = (e: React.MouseEvent | React.TouchEvent) => {
+    const display = displayCanvasRef.current;
+    if (!display) return { x: 0, y: 0 };
+    
+    const rect = display.getBoundingClientRect();
+    const scaleX = display.width / rect.width;
+    const scaleY = display.height / rect.height;
+    
+    let clientX, clientY;
+    if ('touches' in e && (e as React.TouchEvent).touches.length > 0) {
+      clientX = (e as React.TouchEvent).touches[0].clientX;
+      clientY = (e as React.TouchEvent).touches[0].clientY;
+    } else {
+      const mouseEvent = e as React.MouseEvent;
+      clientX = mouseEvent.clientX;
+      clientY = mouseEvent.clientY;
+    }
+    
+    return {
+      x: (clientX - rect.left) * scaleX,
+      y: (clientY - rect.top) * scaleY
+    };
+  };
+
+  const handleStart = (e: React.MouseEvent | React.TouchEvent) => {
+    const coords = getCoordinates(e);
+    setIsDrawing(true);
+    setMousePos(coords);
+    
+    const maskCtx = maskCanvasRef.current?.getContext('2d');
+    if (maskCtx) {
+      maskCtx.beginPath();
+      maskCtx.moveTo(coords.x, coords.y);
+      draw(e);
+    }
+  };
+
+  const draw = (e: React.MouseEvent | React.TouchEvent) => {
+    const coords = getCoordinates(e);
+    setMousePos(coords);
+
+    if (!isDrawing) return;
+    const maskCtx = maskCanvasRef.current?.getContext('2d');
+    if (!maskCtx) return;
+
+    maskCtx.lineWidth = brushSize;
+    maskCtx.lineCap = 'round';
+    maskCtx.lineJoin = 'round';
+    
+    if (tool === 'brush') {
+      maskCtx.globalCompositeOperation = 'source-over';
+      maskCtx.strokeStyle = 'rgba(0,0,0,1)';
+    } else {
+      maskCtx.globalCompositeOperation = 'destination-out';
+    }
+
+    maskCtx.lineTo(coords.x, coords.y);
+    maskCtx.stroke();
+  };
+
+  const handleSave = () => {
+    const canvas = document.createElement('canvas');
+    const mask = maskCanvasRef.current;
+    const original = canvasRef.current;
+    if (!mask || !original) return;
+
+    canvas.width = original.width;
+    canvas.height = original.height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    ctx.drawImage(original, 0, 0);
+    ctx.globalCompositeOperation = 'destination-in';
+    ctx.drawImage(mask, 0, 0);
+    
+    onSave(canvas.toDataURL('image/png'));
+  };
+
+  return (
+    <motion.div 
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      className="fixed inset-0 bg-white z-[100] flex flex-col font-sans"
+    >
+      {/* Editor Header */}
+      <div className="h-16 px-6 border-b border-gray-100 flex items-center justify-between bg-white shrink-0">
+        <div className="flex items-center gap-3">
+          <button onClick={onClose} className="p-2 hover:bg-gray-100 rounded-lg transition-colors">
+            <X className="w-5 h-5" />
+          </button>
+          <div className="h-6 w-px bg-gray-200" />
+          <h2 className="font-bold tracking-tight text-gray-900 truncate max-w-[200px]">{fileItem.file.name}</h2>
+        </div>
+
+        <div className="flex items-center gap-2 p-1 bg-gray-100 rounded-xl">
+          <button 
+            onClick={() => setTool('brush')}
+            className={`flex items-center gap-2 px-4 py-1.5 rounded-lg text-xs font-bold transition-all ${tool === 'brush' ? 'bg-white shadow-sm text-blue-600' : 'text-gray-500 hover:text-gray-700'}`}
+          >
+            <Brush className="w-3.5 h-3.5" /> Restore
+          </button>
+          <button 
+            onClick={() => setTool('eraser')}
+            className={`flex items-center gap-2 px-4 py-1.5 rounded-lg text-xs font-bold transition-all ${tool === 'eraser' ? 'bg-white shadow-sm text-blue-600' : 'text-gray-500 hover:text-gray-700'}`}
+          >
+            <Eraser className="w-3.5 h-3.5" /> Erase
+          </button>
+        </div>
+
+        <div className="flex items-center gap-3">
+          <button 
+            onClick={() => setShowMaskOnly(!showMaskOnly)}
+            className={`p-2.5 rounded-xl border transition-all ${showMaskOnly ? 'bg-blue-50 border-blue-200 text-blue-600' : 'bg-white border-gray-200 text-gray-400'}`}
+            title="Preview Result"
+          >
+            <Maximize2 className="w-4 h-4" />
+          </button>
+          <button 
+            onClick={handleSave}
+            className="px-6 py-2 bg-blue-600 text-white rounded-lg text-sm font-bold hover:bg-blue-700 transition-colors shadow-sm"
+          >
+            Finished
+          </button>
+        </div>
+      </div>
+
+      <div className="flex-1 flex overflow-hidden bg-gray-50">
+        <div className="w-64 border-r border-gray-100 bg-white p-6 flex flex-col gap-8 overflow-y-auto">
+          <section>
+            <label className="text-[10px] font-black uppercase tracking-[0.2em] text-gray-400 block mb-4">Brush Size</label>
+            <div className="space-y-4">
+              <input 
+                type="range" 
+                min="1" 
+                max="200" 
+                value={brushSize} 
+                onChange={(e) => setBrushSize(parseInt(e.target.value))}
+                className="w-full accent-blue-600"
+              />
+              <div className="flex justify-between items-center text-[10px] font-bold text-gray-400 uppercase tracking-widest text-center">
+                <span className="w-8">1px</span>
+                <span className="text-blue-600 bg-blue-50 px-2 py-0.5 rounded-md">{brushSize}px</span>
+                <span className="w-8">200px</span>
+              </div>
+            </div>
+          </section>
+
+          <section>
+            <label className="text-[10px] font-black uppercase tracking-[0.2em] text-gray-400 block mb-4">Background</label>
+            <div className="grid grid-cols-3 gap-2">
+              {(['checker', 'white', 'black'] as const).map(style => (
+                <button 
+                  key={style}
+                  onClick={() => setBgPreview(style)}
+                  className={`aspect-square rounded-xl border-2 transition-all p-0.5 ${bgPreview === style ? 'border-blue-600' : 'border-transparent'}`}
+                >
+                  <div className={`w-full h-full rounded-lg ${
+                    style === 'checker' ? 'bg-transparency' : style === 'white' ? 'bg-white border border-gray-100' : 'bg-gray-900'
+                  }`} />
+                </button>
+              ))}
+            </div>
+          </section>
+
+          <section className="mt-8 pt-8 border-t border-gray-50">
+             <h4 className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-2">Editor Info</h4>
+             <ul className="text-[10px] font-bold text-gray-400 space-y-2 uppercase tracking-wider">
+               <li className="flex items-center gap-2"><div className="w-2 h-2 bg-blue-500/40 rounded-full" /> Highlighted area stays</li>
+               <li className="flex items-center gap-2"><div className="w-2 h-2 bg-gray-200 rounded-full" /> Dimmed area removed</li>
+             </ul>
+          </section>
+        </div>
+
+        <div className="flex-1 relative overflow-auto p-12 flex items-center justify-center select-none bg-gray-100/50">
+          <div 
+            className={`relative shadow-2xl transition-all duration-300 ${
+              bgPreview === 'checker' ? 'bg-transparency' : bgPreview === 'white' ? 'bg-white' : 'bg-black'
+            }`}
+             onMouseEnter={() => setIsMouseOver(true)}
+             onMouseLeave={() => { setIsMouseOver(false); setIsDrawing(false); }}
+          >
+            <canvas ref={canvasRef} className="hidden" />
+            <canvas ref={maskCanvasRef} className="hidden" />
+            <canvas
+              ref={displayCanvasRef}
+              className="max-w-full max-h-[75vh] w-auto h-auto block cursor-none"
+              onMouseDown={handleStart}
+              onMouseMove={draw}
+              onMouseUp={() => setIsDrawing(false)}
+              onTouchStart={handleStart}
+              onTouchMove={draw}
+              onTouchEnd={() => setIsDrawing(false)}
+            />
+          </div>
+        </div>
+      </div>
+    </motion.div>
+  );
+};
+
+// --- Lightbox Component ---
+
+interface LightboxProps {
+  files: ProcessedFile[];
+  currentIndex: number;
+  onClose: () => void;
+  onNext: () => void;
+  onPrev: () => void;
+  onSetEditing: (id: string) => void;
+  onDownload: (file: ProcessedFile) => void;
+}
+
+const Lightbox: React.FC<LightboxProps> = ({ 
+  files, 
+  currentIndex, 
+  onClose, 
+  onNext, 
+  onPrev, 
+  onSetEditing,
+  onDownload
+}) => {
+  const [showOriginal, setShowOriginal] = useState(false);
+  const file = files[currentIndex];
+
+  if (!file) return null;
+
+  return (
+    <motion.div 
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      className="fixed inset-0 bg-white z-[120] flex flex-col font-sans"
+    >
+      {/* Header */}
+      <div className="h-16 px-6 border-b border-gray-100 flex items-center justify-between bg-white shrink-0">
+        <div className="flex items-center gap-3">
+          <button onClick={onClose} className="p-2 hover:bg-gray-100 rounded-lg transition-colors">
+            <X className="w-5 h-5 text-gray-500" />
+          </button>
+          <div className="h-6 w-px bg-gray-200" />
+          <div className="flex flex-col">
+            <h2 className="font-bold tracking-tight text-gray-900 truncate max-w-[200px] leading-tight">{file.file.name}</h2>
+            <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">{currentIndex + 1} of {files.length}</p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2 p-1 bg-gray-100 rounded-xl">
+          <button 
+            onClick={() => setShowOriginal(false)}
+            className={`px-4 py-1.5 rounded-lg text-xs font-bold transition-all ${!showOriginal ? 'bg-white shadow-sm text-blue-600' : 'text-gray-500'}`}
+          >
+            Removed
+          </button>
+          <button 
+            onClick={() => setShowOriginal(true)}
+            className={`px-4 py-1.5 rounded-lg text-xs font-bold transition-all ${showOriginal ? 'bg-white shadow-sm text-blue-600' : 'text-gray-500'}`}
+          >
+            Original
+          </button>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <button 
+            onClick={() => { onClose(); onSetEditing(file.id); }}
+            className="p-2.5 bg-gray-50 hover:bg-gray-100 text-gray-600 rounded-xl transition-all"
+            title="Refine Edges"
+          >
+            <Edit2 className="w-4 h-4" />
+          </button>
+          <button 
+            onClick={() => onDownload(file)}
+            className="px-6 py-2 bg-blue-600 text-white rounded-xl text-sm font-bold hover:bg-blue-700 transition-colors flex items-center gap-2 shadow-sm"
+          >
+            <Download className="w-4 h-4" /> Save
+          </button>
+        </div>
+      </div>
+
+      {/* Main Preview */}
+      <div className="flex-1 relative bg-[#F9F9FB] flex items-center justify-center overflow-hidden p-8 md:p-16">
+        <div className="absolute inset-0 flex items-center justify-between px-6 pointer-events-none z-10">
+          <button 
+            onClick={(e) => { e.stopPropagation(); onPrev(); }}
+            className="p-4 bg-white/80 backdrop-blur hover:bg-white rounded-full shadow-lg pointer-events-auto transition-all translate-x-0 active:scale-95 disabled:opacity-30"
+            disabled={files.length <= 1}
+          >
+            <RotateCcw className="w-6 h-6 -scale-x-100" />
+          </button>
+          <button 
+            onClick={(e) => { e.stopPropagation(); onNext(); }}
+            className="p-4 bg-white/80 backdrop-blur hover:bg-white rounded-full shadow-lg pointer-events-auto transition-all active:scale-95 disabled:opacity-30"
+            disabled={files.length <= 1}
+          >
+            <RotateCcw className="w-6 h-6" />
+          </button>
+        </div>
+
+        <motion.div 
+          key={file.id + showOriginal}
+          initial={{ opacity: 0, scale: 0.95 }}
+          animate={{ opacity: 1, scale: 1 }}
+          transition={{ duration: 0.3, ease: [0.22, 1, 0.36, 1] }}
+          className={`relative max-w-full max-h-full rounded-2xl overflow-hidden shadow-2xl transition-all ${
+            !showOriginal ? 'bg-transparency shadow-blue-500/10' : 'bg-white'
+          }`}
+        >
+          <img 
+            src={showOriginal ? file.preview : (file.processedUrl || file.preview)} 
+            alt="Full size preview" 
+            className="max-w-full max-h-[70vh] w-auto h-auto object-contain p-2 md:p-4"
+          />
+        </motion.div>
+      </div>
+      
+      {/* Thumbnails Strip */}
+      <div className="h-24 px-6 border-t border-gray-100 flex items-center justify-center gap-3 overflow-x-auto bg-white">
+        {files.map((f, idx) => (
+          <button 
+            key={f.id}
+            onClick={() => { if (currentIndex !== idx) { setShowOriginal(false); if (idx > currentIndex) { onNext(); } else { onPrev(); } } }}
+            className={`w-14 h-14 rounded-xl border-2 transition-all p-1 shrink-0 ${
+              currentIndex === idx ? 'border-blue-600 scale-110 shadow-md' : 'border-transparent opacity-50 hover:opacity-100'
+            }`}
+          >
+            <img src={f.processedUrl || f.preview} className="w-full h-full object-cover rounded-lg" alt="Thumbnail" />
+          </button>
+        ))}
+      </div>
+    </motion.div>
+  );
+};
 
 // --- App Component ---
 
 export default function App() {
   const [files, setFiles] = useState<ProcessedFile[]>([]);
   const [isProcessingAll, setIsProcessingAll] = useState(false);
+  const [editingFileId, setEditingFileId] = useState<string | null>(null);
+  const [previewFileId, setPreviewFileId] = useState<string | null>(null);
 
   const onDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -52,10 +527,13 @@ export default function App() {
 
   const addFiles = (newFiles: File[]) => {
     const newProcessedFiles: ProcessedFile[] = newFiles.map(file => ({
-      id: Math.random().toString(36).substr(2, 9),
+      id: typeof crypto !== 'undefined' && crypto.randomUUID 
+        ? crypto.randomUUID() 
+        : `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
       file,
       preview: URL.createObjectURL(file),
       processedUrl: null,
+      maskUrl: null,
       status: 'pending',
       progress: 0
     }));
@@ -80,7 +558,6 @@ export default function App() {
     setFiles(prev => prev.map(f => f.id === id ? { ...f, status: 'processing', progress: 10 } : f));
 
     try {
-      // Configuration for high quality
       const blob = await removeBackground(fileItem.file, {
         progress: (p: any) => {
            setFiles(prev => prev.map(f => f.id === id ? { ...f, progress: Math.round((p as number) * 100) } : f));
@@ -136,6 +613,14 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
+  const handleEditSave = (processedUrl: string) => {
+    if (!editingFileId) return;
+    setFiles(prev => prev.map(f => f.id === editingFileId ? { ...f, processedUrl } : f));
+    setEditingFileId(null);
+  };
+
+  const currentEditingFile = files.find(f => f.id === editingFileId);
+
   return (
     <div className="min-h-screen bg-white text-gray-900 font-sans selection:bg-blue-100">
       {/* Top Navigation */}
@@ -148,7 +633,7 @@ export default function App() {
           <a href="#" className="text-black">Remover</a>
           <a href="#" className="hover:text-black transition-colors">How it works</a>
           <a href="#" className="hover:text-black transition-colors">Privacy</a>
-          <a href="#" className="px-5 py-2 bg-gray-900 text-white rounded-full hover:bg-black transition-all">Free Forever</a>
+          <a href="#" className="px-5 py-2 bg-gray-900 text-white rounded-full hover:bg-black transition-all font-bold">Free Forever</a>
         </div>
       </nav>
 
@@ -168,7 +653,7 @@ export default function App() {
             transition={{ delay: 0.1 }}
             className="text-gray-500 text-lg md:text-xl max-w-lg mx-auto font-medium"
           >
-            Upload multiple images and let our AI do the heavy lifting. <br className="hidden md:block" /> Fast, precise, and completely free.
+            Upload multiple images and let our AI do the heavy lifting.<br className="hidden md:block" /> Fast, precise, and completely free.
           </motion.p>
         </div>
 
@@ -242,12 +727,19 @@ export default function App() {
                     exit={{ opacity: 0, scale: 0.95 }}
                     className="bg-white border border-gray-100 rounded-2xl p-3 flex flex-col gap-4 shadow-sm hover:shadow-md transition-all group"
                   >
-                    <div className="aspect-square bg-gray-50 rounded-xl overflow-hidden relative border border-gray-50">
-                       <img 
-                          src={file.processedUrl || file.preview} 
-                          className={`w-full h-full object-contain p-2 transition-all duration-700 ${file.status === 'processing' ? 'scale-90 opacity-40 blur-sm' : 'scale-100 opacity-100'}`} 
-                          alt="Preview" 
-                        />
+                    <div 
+                      className="aspect-square bg-gray-50 rounded-xl overflow-hidden relative border border-gray-50 cursor-zoom-in group"
+                      onClick={() => file.status === 'done' && setPreviewFileId(file.id)}
+                    >
+                       <div 
+                         className={`w-full h-full p-2 transition-all duration-700 ${file.status === 'processing' ? 'scale-90 opacity-40 blur-sm' : 'scale-100 opacity-100'} ${file.status === 'done' ? 'bg-transparency' : ''}`}
+                       >
+                         <img 
+                            src={file.processedUrl || file.preview} 
+                            className="w-full h-full object-contain" 
+                            alt="Preview" 
+                          />
+                       </div>
                        
                        {/* Success/Processing/Error indicator */}
                        <div className="absolute top-2 right-2">
@@ -273,7 +765,7 @@ export default function App() {
                         )}
 
                         {/* Action Buttons overlay */}
-                        <div className="absolute bottom-2 left-2 right-2 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity translate-y-2 group-hover:translate-y-0 duration-300">
+                        <div className="absolute bottom-2 left-2 right-2 flex gap-2 opacity-0 group-hover:opacity-100 transition-all translate-y-2 group-hover:translate-y-0 duration-300">
                           <button 
                              onClick={() => removeFile(file.id)}
                              className="p-2 bg-white/90 backdrop-blur text-red-500 hover:bg-red-50 rounded-lg shadow-sm transition-colors"
@@ -281,12 +773,20 @@ export default function App() {
                              <Trash2 className="w-4 h-4" />
                           </button>
                           {file.status === 'done' ? (
-                             <button 
-                               onClick={() => downloadFile(file)}
-                               className="flex-1 bg-white/90 backdrop-blur text-gray-900 border border-gray-100 font-bold text-xs py-2 rounded-lg shadow-sm hover:bg-white transition-colors flex items-center justify-center gap-1.5"
-                             >
-                               <Download className="w-3.5 h-3.5 text-blue-600" /> Save
-                             </button>
+                             <>
+                               <button 
+                                 onClick={() => setEditingFileId(file.id)}
+                                 className="flex-1 bg-white/90 backdrop-blur text-gray-900 border border-gray-100 font-bold text-xs py-2 rounded-lg shadow-sm hover:bg-white transition-colors flex items-center justify-center gap-1.5"
+                               >
+                                 <Edit2 className="w-3.5 h-3.5 text-blue-600" /> Refine
+                               </button>
+                               <button 
+                                 onClick={() => downloadFile(file)}
+                                 className="p-2 bg-white/90 backdrop-blur text-blue-600 border border-gray-100 rounded-lg shadow-sm hover:bg-white transition-colors"
+                               >
+                                 <Download className="w-4 h-4" />
+                               </button>
+                             </>
                           ) : (
                              <button 
                                onClick={() => processFile(file.id)}
@@ -326,6 +826,35 @@ export default function App() {
           </div>
         )}
       </main>
+
+      <AnimatePresence>
+        {currentEditingFile && (
+          <MaskEditor 
+            fileItem={currentEditingFile} 
+            onClose={() => setEditingFileId(null)} 
+            onSave={handleEditSave}
+          />
+        )}
+        {previewFileId && (
+          <Lightbox 
+            files={files.filter(f => f.status === 'done')}
+            currentIndex={files.filter(f => f.status === 'done').findIndex(f => f.id === previewFileId)}
+            onClose={() => setPreviewFileId(null)}
+            onNext={() => {
+              const doneFiles = files.filter(f => f.status === 'done');
+              const idx = doneFiles.findIndex(f => f.id === previewFileId);
+              setPreviewFileId(doneFiles[(idx + 1) % doneFiles.length].id);
+            }}
+            onPrev={() => {
+              const doneFiles = files.filter(f => f.status === 'done');
+              const idx = doneFiles.findIndex(f => f.id === previewFileId);
+              setPreviewFileId(doneFiles[(idx - 1 + doneFiles.length) % doneFiles.length].id);
+            }}
+            onSetEditing={(id) => setEditingFileId(id)}
+            onDownload={(file) => downloadFile(file)}
+          />
+        )}
+      </AnimatePresence>
 
       {/* Bottom Bar Info */}
       <footer className="mt-auto h-auto md:h-16 px-6 md:px-10 border-t border-gray-100 flex flex-col md:flex-row items-center justify-between py-6 md:py-0 text-[10px] font-bold text-gray-400 uppercase tracking-[0.15em] bg-white gap-4">
