@@ -52,14 +52,18 @@ const MaskEditor: React.FC<MaskEditorProps> = ({ fileItem, onSave, onClose }) =>
   const [brushSize, setBrushSize] = useState(30);
   const [tool, setTool] = useState<'brush' | 'eraser'>('brush');
   const [bgPreview, setBgPreview] = useState<'checker' | 'white' | 'black'>('checker');
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
   const [showMaskOnly, setShowMaskOnly] = useState(false);
   const canvasRef = React.useRef<HTMLCanvasElement>(null);
   const maskCanvasRef = React.useRef<HTMLCanvasElement>(null);
   const displayCanvasRef = React.useRef<HTMLCanvasElement>(null);
   const [isDrawing, setIsDrawing] = useState(false);
+  const [isPanning, setIsPanning] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [mousePos, setMousePos] = useState({ x: -100, y: -100 });
   const [isMouseOver, setIsMouseOver] = useState(false);
+  const [lastPanPos, setLastPanPos] = useState({ x: 0, y: 0 });
 
   useEffect(() => {
     const setupCanvases = async () => {
@@ -124,6 +128,12 @@ const MaskEditor: React.FC<MaskEditorProps> = ({ fileItem, onSave, onClose }) =>
       if (!dCtx) return;
 
       dCtx.clearRect(0, 0, display.width, display.height);
+      dCtx.save();
+      
+      // Apply Pan and Zoom
+      dCtx.translate(display.width / 2 + pan.x, display.height / 2 + pan.y);
+      dCtx.scale(zoom, zoom);
+      dCtx.translate(-display.width / 2, -display.height / 2);
 
       if (showMaskOnly) {
         // Just show the resulting cutout
@@ -149,36 +159,44 @@ const MaskEditor: React.FC<MaskEditorProps> = ({ fileItem, onSave, onClose }) =>
         }
       }
 
-      // Draw cursor
-      if (isMouseOver && !isLoading) {
-        const rect = display.getBoundingClientRect();
-        const scaleX = display.width / rect.width;
-        
+      // Draw active brush feedback
+      if (isMouseOver && !isLoading && !isPanning) {
         dCtx.beginPath();
-        dCtx.arc(mousePos.x, mousePos.y, (brushSize / 2) * scaleX * (rect.width / display.width), 0, Math.PI * 2);
-        dCtx.strokeStyle = 'white';
-        dCtx.lineWidth = 2;
+        dCtx.arc(mousePos.x, mousePos.y, brushSize / 2, 0, Math.PI * 2);
+        
+        // Visual indicator of what will be erased/restored
+        if (tool === 'brush') {
+          dCtx.strokeStyle = 'rgba(59, 130, 246, 0.8)';
+          dCtx.fillStyle = 'rgba(59, 130, 246, 0.2)';
+        } else {
+          dCtx.strokeStyle = 'rgba(239, 68, 68, 0.8)';
+          dCtx.fillStyle = 'rgba(239, 68, 68, 0.2)';
+        }
+        
+        dCtx.fill();
+        dCtx.lineWidth = 2 / zoom;
         dCtx.stroke();
-        dCtx.strokeStyle = 'black';
-        dCtx.lineWidth = 1;
-        dCtx.stroke();
+        
+        // Inner white dot
+        dCtx.beginPath();
+        dCtx.arc(mousePos.x, mousePos.y, 1 / zoom, 0, Math.PI * 2);
+        dCtx.fillStyle = 'white';
+        dCtx.fill();
       }
 
+      dCtx.restore();
       rafId = requestAnimationFrame(render);
     };
 
     render();
     return () => cancelAnimationFrame(rafId);
-  }, [isLoading, mousePos, brushSize, isMouseOver, showMaskOnly]);
+  }, [isLoading, mousePos, brushSize, isMouseOver, showMaskOnly, zoom, pan, tool, isPanning]);
 
   const getCoordinates = (e: React.MouseEvent | React.TouchEvent) => {
     const display = displayCanvasRef.current;
     if (!display) return { x: 0, y: 0 };
     
     const rect = display.getBoundingClientRect();
-    const scaleX = display.width / rect.width;
-    const scaleY = display.height / rect.height;
-    
     let clientX, clientY;
     if ('touches' in e && (e as React.TouchEvent).touches.length > 0) {
       clientX = (e as React.TouchEvent).touches[0].clientX;
@@ -188,14 +206,27 @@ const MaskEditor: React.FC<MaskEditorProps> = ({ fileItem, onSave, onClose }) =>
       clientX = mouseEvent.clientX;
       clientY = mouseEvent.clientY;
     }
-    
-    return {
-      x: (clientX - rect.left) * scaleX,
-      y: (clientY - rect.top) * scaleY
-    };
+
+    // Convert screen to canvas
+    const x = (clientX - rect.left) * (display.width / rect.width);
+    const y = (clientY - rect.top) * (display.height / rect.height);
+
+    // Apply Inverse Transform (Zoom/Pan)
+    const worldX = (x - (display.width / 2 + pan.x)) / zoom + (display.width / 2);
+    const worldY = (y - (display.height / 2 + pan.y)) / zoom + (display.height / 2);
+
+    return { x: worldX, y: worldY };
   };
 
   const handleStart = (e: React.MouseEvent | React.TouchEvent) => {
+    if ('button' in e && e.button === 1 || (e as any).altKey) {
+      setIsPanning(true);
+      const clientX = 'touches' in e ? e.touches[0].clientX : (e as React.MouseEvent).clientX;
+      const clientY = 'touches' in e ? e.touches[0].clientY : (e as React.MouseEvent).clientY;
+      setLastPanPos({ x: clientX, y: clientY });
+      return;
+    }
+
     const coords = getCoordinates(e);
     setIsDrawing(true);
     setMousePos(coords);
@@ -209,6 +240,17 @@ const MaskEditor: React.FC<MaskEditorProps> = ({ fileItem, onSave, onClose }) =>
   };
 
   const draw = (e: React.MouseEvent | React.TouchEvent) => {
+    const clientX = 'touches' in e ? e.touches[0].clientX : (e as React.MouseEvent).clientX;
+    const clientY = 'touches' in e ? e.touches[0].clientY : (e as React.MouseEvent).clientY;
+
+    if (isPanning) {
+      const dx = clientX - lastPanPos.x;
+      const dy = clientY - lastPanPos.y;
+      setPan(prev => ({ x: prev.x + dx, y: prev.y + dy }));
+      setLastPanPos({ x: clientX, y: clientY });
+      return;
+    }
+
     const coords = getCoordinates(e);
     setMousePos(coords);
 
@@ -255,8 +297,11 @@ const MaskEditor: React.FC<MaskEditorProps> = ({ fileItem, onSave, onClose }) =>
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
       className="fixed inset-0 bg-white z-[100] flex flex-col font-sans"
+      onWheel={(e) => {
+        const delta = e.deltaY > 0 ? 0.9 : 1.1;
+        setZoom(prev => Math.min(Math.max(prev * delta, 0.1), 10));
+      }}
     >
-      {/* Editor Header */}
       <div className="h-16 px-6 border-b border-gray-100 flex items-center justify-between bg-white shrink-0">
         <div className="flex items-center gap-3">
           <button onClick={onClose} className="p-2 hover:bg-gray-100 rounded-lg transition-colors">
@@ -282,6 +327,18 @@ const MaskEditor: React.FC<MaskEditorProps> = ({ fileItem, onSave, onClose }) =>
         </div>
 
         <div className="flex items-center gap-3">
+          <div className="flex items-center gap-1 bg-gray-100 p-1 rounded-xl">
+            <button onClick={() => setZoom(prev => Math.max(0.1, prev - 0.2))} className="p-1.5 hover:bg-white rounded-lg transition-all"><X className="w-3.5 h-3.5 rotate-45" /></button>
+            <span className="text-[10px] font-black w-10 text-center uppercase tracking-tighter">{Math.round(zoom * 100)}%</span>
+            <button onClick={() => setZoom(prev => Math.min(10, prev + 0.2))} className="p-1.5 hover:bg-white rounded-lg transition-all"><Plus className="w-3.5 h-3.5" /></button>
+          </div>
+          <button 
+            onClick={() => { setZoom(1); setPan({ x: 0, y: 0 }); }}
+            className="p-2.5 rounded-xl border border-gray-200 text-gray-400 hover:bg-gray-50 transition-all"
+            title="Reset View"
+          >
+            <RotateCcw className="w-4 h-4" />
+          </button>
           <button 
             onClick={() => setShowMaskOnly(!showMaskOnly)}
             className={`p-2.5 rounded-xl border transition-all ${showMaskOnly ? 'bg-blue-50 border-blue-200 text-blue-600' : 'bg-white border-gray-200 text-gray-400'}`}
@@ -337,10 +394,10 @@ const MaskEditor: React.FC<MaskEditorProps> = ({ fileItem, onSave, onClose }) =>
           </section>
 
           <section className="mt-8 pt-8 border-t border-gray-50">
-             <h4 className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-2">Editor Info</h4>
+             <h4 className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-2">Controls</h4>
              <ul className="text-[10px] font-bold text-gray-400 space-y-2 uppercase tracking-wider">
-               <li className="flex items-center gap-2"><div className="w-2 h-2 bg-blue-500/40 rounded-full" /> Highlighted area stays</li>
-               <li className="flex items-center gap-2"><div className="w-2 h-2 bg-gray-200 rounded-full" /> Dimmed area removed</li>
+               <li className="flex items-center gap-2"><div className="w-4 h-4 bg-gray-100 rounded flex items-center justify-center text-[8px]">WHL</div> Scroll to Zoom</li>
+               <li className="flex items-center gap-2"><div className="w-4 h-4 bg-gray-100 rounded flex items-center justify-center text-[8px]">ALT</div> + Drag to Pan</li>
              </ul>
           </section>
         </div>
@@ -351,19 +408,19 @@ const MaskEditor: React.FC<MaskEditorProps> = ({ fileItem, onSave, onClose }) =>
               bgPreview === 'checker' ? 'bg-transparency' : bgPreview === 'white' ? 'bg-white' : 'bg-black'
             }`}
              onMouseEnter={() => setIsMouseOver(true)}
-             onMouseLeave={() => { setIsMouseOver(false); setIsDrawing(false); }}
+             onMouseLeave={() => { setIsMouseOver(false); setIsDrawing(false); setIsPanning(false); }}
           >
             <canvas ref={canvasRef} className="hidden" />
             <canvas ref={maskCanvasRef} className="hidden" />
             <canvas
               ref={displayCanvasRef}
-              className="max-w-full max-h-[75vh] w-auto h-auto block cursor-none"
+              className={`max-w-full max-h-[75vh] w-auto h-auto block ${isPanning ? 'cursor-grabbing' : 'cursor-none'}`}
               onMouseDown={handleStart}
               onMouseMove={draw}
-              onMouseUp={() => setIsDrawing(false)}
+              onMouseUp={() => { setIsDrawing(false); setIsPanning(false); }}
               onTouchStart={handleStart}
               onTouchMove={draw}
-              onTouchEnd={() => setIsDrawing(false)}
+              onTouchEnd={() => { setIsDrawing(false); setIsPanning(false); }}
             />
           </div>
         </div>
@@ -394,9 +451,46 @@ const Lightbox: React.FC<LightboxProps> = ({
   onDownload
 }) => {
   const [showOriginal, setShowOriginal] = useState(false);
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [isDragging, setIsDragging] = useState(false);
+  const [lastPos, setLastPos] = useState({ x: 0, y: 0 });
+
   const file = files[currentIndex];
 
   if (!file) return null;
+
+  const handleReset = () => {
+    setZoom(1);
+    setPan({ x: 0, y: 0 });
+  };
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    if (zoom > 1) {
+      setIsDragging(true);
+      setLastPos({ x: e.clientX, y: e.clientY });
+    }
+  };
+
+  const handleMouseMove = (e: React.MouseEvent) => {
+    if (isDragging) {
+      const dx = e.clientX - lastPos.x;
+      const dy = e.clientY - lastPos.y;
+      setPan(prev => ({ x: prev.x + dx, y: prev.y + dy }));
+      setLastPos({ x: e.clientX, y: e.clientY });
+    }
+  };
+
+  const handleMouseUp = () => {
+    setIsDragging(false);
+  };
+
+  const handleWheel = (e: React.WheelEvent) => {
+    const delta = e.deltaY > 0 ? 0.9 : 1.1;
+    const newZoom = Math.min(Math.max(zoom * delta, 0.5), 10);
+    setZoom(newZoom);
+    if (newZoom === 1) setPan({ x: 0, y: 0 });
+  };
 
   return (
     <motion.div 
@@ -434,6 +528,34 @@ const Lightbox: React.FC<LightboxProps> = ({
         </div>
 
         <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1 bg-gray-100 p-1 rounded-xl mr-2">
+            <button 
+              onClick={() => {
+                const newZoom = Math.max(0.5, zoom - 0.2);
+                setZoom(newZoom);
+                if (newZoom === 1) setPan({ x: 0, y: 0 });
+              }} 
+              className="p-1.5 hover:bg-white rounded-lg transition-all"
+            >
+              <X className="w-3.5 h-3.5 rotate-45" />
+            </button>
+            <span className="text-[10px] font-black w-10 text-center uppercase tracking-tighter">{Math.round(zoom * 100)}%</span>
+            <button 
+              onClick={() => setZoom(prev => Math.min(10, prev + 0.2))} 
+              className="p-1.5 hover:bg-white rounded-lg transition-all"
+            >
+              <Plus className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          <button 
+            onClick={handleReset}
+            className="p-2.5 bg-gray-50 hover:bg-gray-100 text-gray-500 rounded-xl transition-all mr-2"
+            title="Reset Zoom"
+          >
+            <RotateCcw className="w-4 h-4" />
+          </button>
+
           <button 
             onClick={() => { onClose(); onSetEditing(file.id); }}
             className="p-2.5 bg-gray-50 hover:bg-gray-100 text-gray-600 rounded-xl transition-all"
@@ -451,17 +573,25 @@ const Lightbox: React.FC<LightboxProps> = ({
       </div>
 
       {/* Main Preview */}
-      <div className="flex-1 relative bg-[#F9F9FB] flex items-center justify-center overflow-hidden p-8 md:p-16">
+      <div 
+        className="flex-1 relative bg-[#F9F9FB] flex items-center justify-center overflow-hidden p-8 md:p-16 select-none"
+        onWheel={handleWheel}
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={handleMouseUp}
+        onMouseLeave={handleMouseUp}
+        style={{ cursor: zoom > 1 ? (isDragging ? 'grabbing' : 'grab') : 'default' }}
+      >
         <div className="absolute inset-0 flex items-center justify-between px-6 pointer-events-none z-10">
           <button 
-            onClick={(e) => { e.stopPropagation(); onPrev(); }}
+            onClick={(e) => { e.stopPropagation(); onPrev(); handleReset(); }}
             className="p-4 bg-white/80 backdrop-blur hover:bg-white rounded-full shadow-lg pointer-events-auto transition-all translate-x-0 active:scale-95 disabled:opacity-30"
             disabled={files.length <= 1}
           >
             <RotateCcw className="w-6 h-6 -scale-x-100" />
           </button>
           <button 
-            onClick={(e) => { e.stopPropagation(); onNext(); }}
+            onClick={(e) => { e.stopPropagation(); onNext(); handleReset(); }}
             className="p-4 bg-white/80 backdrop-blur hover:bg-white rounded-full shadow-lg pointer-events-auto transition-all active:scale-95 disabled:opacity-30"
             disabled={files.length <= 1}
           >
@@ -474,14 +604,18 @@ const Lightbox: React.FC<LightboxProps> = ({
           initial={{ opacity: 0, scale: 0.95 }}
           animate={{ opacity: 1, scale: 1 }}
           transition={{ duration: 0.3, ease: [0.22, 1, 0.36, 1] }}
-          className={`relative max-w-full max-h-full rounded-2xl overflow-hidden shadow-2xl transition-all ${
+          style={{
+            transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+            transformOrigin: 'center center',
+          }}
+          className={`relative max-w-full max-h-full rounded-2xl overflow-hidden shadow-2xl transition-shadow ${
             !showOriginal ? 'bg-transparency shadow-blue-500/10' : 'bg-white'
           }`}
         >
           <img 
             src={showOriginal ? file.preview : (file.processedUrl || file.preview)} 
             alt="Full size preview" 
-            className="max-w-full max-h-[70vh] w-auto h-auto object-contain p-2 md:p-4"
+            className="max-w-full max-h-[70vh] w-auto h-auto object-contain p-2 md:p-4 pointer-events-none"
           />
         </motion.div>
       </div>
