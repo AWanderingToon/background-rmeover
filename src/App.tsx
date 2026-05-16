@@ -22,7 +22,9 @@ import {
   Square,
   Maximize2,
   RotateCcw,
-  Undo2
+  Undo2,
+  Wand2,
+  MousePointer2
 } from 'lucide-react';
 import { removeBackground } from '@imgly/background-removal';
 import JSZip from 'jszip';
@@ -50,7 +52,8 @@ interface MaskEditorProps {
 
 const MaskEditor: React.FC<MaskEditorProps> = ({ fileItem, onSave, onClose }) => {
   const [brushSize, setBrushSize] = useState(30);
-  const [tool, setTool] = useState<'brush' | 'eraser'>('brush');
+  const [tool, setTool] = useState<'brush' | 'eraser' | 'magic'>('brush');
+  const [magicTolerance, setMagicTolerance] = useState(30);
   const [bgPreview, setBgPreview] = useState<'checker' | 'white' | 'black'>('checker');
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
@@ -159,23 +162,38 @@ const MaskEditor: React.FC<MaskEditorProps> = ({ fileItem, onSave, onClose }) =>
         }
       }
 
-      // Draw active brush feedback
+      // Draw active brush/magic feedback
       if (isMouseOver && !isLoading && !isPanning) {
-        dCtx.beginPath();
-        dCtx.arc(mousePos.x, mousePos.y, brushSize / 2, 0, Math.PI * 2);
-        
-        // Visual indicator of what will be erased/restored
-        if (tool === 'brush') {
-          dCtx.strokeStyle = 'rgba(59, 130, 246, 0.8)';
-          dCtx.fillStyle = 'rgba(59, 130, 246, 0.2)';
+        if (tool === 'magic') {
+          // Crosshair for magic tool
+          dCtx.beginPath();
+          dCtx.moveTo(mousePos.x - 10 / zoom, mousePos.y);
+          dCtx.lineTo(mousePos.x + 10 / zoom, mousePos.y);
+          dCtx.moveTo(mousePos.x, mousePos.y - 10 / zoom);
+          dCtx.lineTo(mousePos.x, mousePos.y + 10 / zoom);
+          dCtx.strokeStyle = 'white';
+          dCtx.lineWidth = 2 / zoom;
+          dCtx.stroke();
+          dCtx.strokeStyle = '#3b82f6';
+          dCtx.lineWidth = 1 / zoom;
+          dCtx.stroke();
         } else {
-          dCtx.strokeStyle = 'rgba(239, 68, 68, 0.8)';
-          dCtx.fillStyle = 'rgba(239, 68, 68, 0.2)';
+          dCtx.beginPath();
+          dCtx.arc(mousePos.x, mousePos.y, brushSize / 2, 0, Math.PI * 2);
+          
+          // Visual indicator of what will be erased/restored
+          if (tool === 'brush') {
+            dCtx.strokeStyle = 'rgba(59, 130, 246, 0.8)';
+            dCtx.fillStyle = 'rgba(59, 130, 246, 0.2)';
+          } else {
+            dCtx.strokeStyle = 'rgba(239, 68, 68, 0.8)';
+            dCtx.fillStyle = 'rgba(239, 68, 68, 0.2)';
+          }
+          
+          dCtx.fill();
+          dCtx.lineWidth = 2 / zoom;
+          dCtx.stroke();
         }
-        
-        dCtx.fill();
-        dCtx.lineWidth = 2 / zoom;
-        dCtx.stroke();
         
         // Inner white dot
         dCtx.beginPath();
@@ -219,7 +237,12 @@ const MaskEditor: React.FC<MaskEditorProps> = ({ fileItem, onSave, onClose }) =>
   };
 
   const handleStart = (e: React.MouseEvent | React.TouchEvent) => {
-    if ('button' in e && e.button === 1 || (e as any).altKey) {
+    // Middle click (button 1) or Alt key for panning
+    const isMiddleClick = 'button' in e && (e.button === 1 || (e.nativeEvent as any).button === 1);
+    const isAltKey = (e as any).altKey || (e.nativeEvent as any).altKey;
+
+    if (isMiddleClick || isAltKey) {
+      e.preventDefault();
       setIsPanning(true);
       const clientX = 'touches' in e ? e.touches[0].clientX : (e as React.MouseEvent).clientX;
       const clientY = 'touches' in e ? e.touches[0].clientY : (e as React.MouseEvent).clientY;
@@ -228,6 +251,12 @@ const MaskEditor: React.FC<MaskEditorProps> = ({ fileItem, onSave, onClose }) =>
     }
 
     const coords = getCoordinates(e);
+    
+    if (tool === 'magic') {
+      applySmartSelect(coords.x, coords.y);
+      return;
+    }
+
     setIsDrawing(true);
     setMousePos(coords);
     
@@ -237,6 +266,76 @@ const MaskEditor: React.FC<MaskEditorProps> = ({ fileItem, onSave, onClose }) =>
       maskCtx.moveTo(coords.x, coords.y);
       draw(e);
     }
+  };
+
+  const applySmartSelect = (startX: number, startY: number) => {
+    const canvas = canvasRef.current;
+    const maskCanvas = maskCanvasRef.current;
+    if (!canvas || !maskCanvas) return;
+
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const maskCtx = maskCanvas.getContext('2d');
+    if (!ctx || !maskCtx) return;
+
+    const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const maskData = maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
+    
+    const x = Math.floor(startX);
+    const y = Math.floor(startY);
+    const index = (y * canvas.width + x) * 4;
+    
+    const targetR = imgData.data[index];
+    const targetG = imgData.data[index + 1];
+    const targetB = imgData.data[index + 2];
+    
+    const visited = new Uint8Array(canvas.width * canvas.height);
+    const queue: [number, number][] = [[x, y]];
+    visited[y * canvas.width + x] = 1;
+
+    // Simple flood fill with tolerance
+    while (queue.length > 0) {
+      const [currX, currY] = queue.shift()!;
+      const currIdx = (currY * canvas.width + currX) * 4;
+      
+      // Update mask
+      // Fill or erase based on tool context? 
+      // For simplicity, magic tool in "Restore" mode adds to mask, in "Erase" (if toggled) removes.
+      // But let's make Magic tool always "Select Object" (Restore)
+      maskData.data[currIdx + 3] = 255; 
+
+      const neighbors = [
+        [currX + 1, currY], [currX - 1, currY],
+        [currX, currY + 1], [currX, currY - 1]
+      ];
+
+      for (const [nx, ny] of neighbors) {
+        if (nx >= 0 && nx < canvas.width && ny >= 0 && ny < canvas.height) {
+          const nIdx = ny * canvas.width + nx;
+          if (!visited[nIdx]) {
+            const pixelIdx = nIdx * 4;
+            const r = imgData.data[pixelIdx];
+            const g = imgData.data[pixelIdx + 1];
+            const b = imgData.data[pixelIdx + 2];
+            
+            const diff = Math.sqrt(
+              Math.pow(r - targetR, 2) + 
+              Math.pow(g - targetG, 2) + 
+              Math.pow(b - targetB, 2)
+            );
+
+            if (diff <= magicTolerance) {
+              visited[nIdx] = 1;
+              queue.push([nx, ny]);
+            }
+          }
+        }
+      }
+      
+      // Limit iterations to avoid freezing for huge areas in one frame
+      if (visited.length > 500000) break; 
+    }
+
+    maskCtx.putImageData(maskData, 0, 0);
   };
 
   const draw = (e: React.MouseEvent | React.TouchEvent) => {
@@ -319,6 +418,13 @@ const MaskEditor: React.FC<MaskEditorProps> = ({ fileItem, onSave, onClose }) =>
             <Brush className="w-3.5 h-3.5" /> Restore
           </button>
           <button 
+            onClick={() => setTool('magic')}
+            className={`flex items-center gap-2 px-4 py-1.5 rounded-lg text-xs font-bold transition-all ${tool === 'magic' ? 'bg-white shadow-sm text-blue-600' : 'text-gray-500 hover:text-gray-700'}`}
+            title="Smart Select - Click an object to auto-mask it"
+          >
+            <Wand2 className="w-3.5 h-3.5" /> Smart
+          </button>
+          <button 
             onClick={() => setTool('eraser')}
             className={`flex items-center gap-2 px-4 py-1.5 rounded-lg text-xs font-bold transition-all ${tool === 'eraser' ? 'bg-white shadow-sm text-blue-600' : 'text-gray-500 hover:text-gray-700'}`}
           >
@@ -357,24 +463,48 @@ const MaskEditor: React.FC<MaskEditorProps> = ({ fileItem, onSave, onClose }) =>
 
       <div className="flex-1 flex overflow-hidden bg-gray-50">
         <div className="w-64 border-r border-gray-100 bg-white p-6 flex flex-col gap-8 overflow-y-auto">
-          <section>
-            <label className="text-[10px] font-black uppercase tracking-[0.2em] text-gray-400 block mb-4">Brush Size</label>
-            <div className="space-y-4">
-              <input 
-                type="range" 
-                min="1" 
-                max="200" 
-                value={brushSize} 
-                onChange={(e) => setBrushSize(parseInt(e.target.value))}
-                className="w-full accent-blue-600"
-              />
-              <div className="flex justify-between items-center text-[10px] font-bold text-gray-400 uppercase tracking-widest text-center">
-                <span className="w-8">1px</span>
-                <span className="text-blue-600 bg-blue-50 px-2 py-0.5 rounded-md">{brushSize}px</span>
-                <span className="w-8">200px</span>
+          {tool === 'magic' ? (
+            <section className="animate-in fade-in zoom-in-95 duration-200">
+               <label className="text-[10px] font-black uppercase tracking-[0.2em] text-gray-400 block mb-4">Smart Tolerance</label>
+               <div className="space-y-4">
+                <input 
+                  type="range" 
+                  min="1" 
+                  max="100" 
+                  value={magicTolerance} 
+                  onChange={(e) => setMagicTolerance(parseInt(e.target.value))}
+                  className="w-full accent-blue-600"
+                />
+                <div className="flex justify-between items-center text-[10px] font-bold text-gray-400 uppercase tracking-widest text-center">
+                  <span className="w-8">Tight</span>
+                  <span className="text-blue-600 bg-blue-50 px-2 py-0.5 rounded-md">{magicTolerance}</span>
+                  <span className="w-8">Loose</span>
+                </div>
+                <p className="text-[10px] text-gray-400 leading-relaxed italic mt-4">
+                  AI guesses which area to include based on color. Higher tolerance includes more colors.
+                </p>
               </div>
-            </div>
-          </section>
+            </section>
+          ) : (
+            <section className="animate-in fade-in zoom-in-95 duration-200">
+              <label className="text-[10px] font-black uppercase tracking-[0.2em] text-gray-400 block mb-4">Brush Size</label>
+              <div className="space-y-4">
+                <input 
+                  type="range" 
+                  min="1" 
+                  max="200" 
+                  value={brushSize} 
+                  onChange={(e) => setBrushSize(parseInt(e.target.value))}
+                  className="w-full accent-blue-600"
+                />
+                <div className="flex justify-between items-center text-[10px] font-bold text-gray-400 uppercase tracking-widest text-center">
+                  <span className="w-8">1px</span>
+                  <span className="text-blue-600 bg-blue-50 px-2 py-0.5 rounded-md">{brushSize}px</span>
+                  <span className="w-8">200px</span>
+                </div>
+              </div>
+            </section>
+          )}
 
           <section>
             <label className="text-[10px] font-black uppercase tracking-[0.2em] text-gray-400 block mb-4">Background</label>
@@ -396,6 +526,7 @@ const MaskEditor: React.FC<MaskEditorProps> = ({ fileItem, onSave, onClose }) =>
           <section className="mt-8 pt-8 border-t border-gray-50">
              <h4 className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-2">Controls</h4>
              <ul className="text-[10px] font-bold text-gray-400 space-y-2 uppercase tracking-wider">
+               <li className="flex items-center gap-2"><div className="w-4 h-4 bg-gray-100 rounded flex items-center justify-center text-[8px]"><MousePointer2 className="w-2 h-2" /></div> Middle Click to Pan</li>
                <li className="flex items-center gap-2"><div className="w-4 h-4 bg-gray-100 rounded flex items-center justify-center text-[8px]">WHL</div> Scroll to Zoom</li>
                <li className="flex items-center gap-2"><div className="w-4 h-4 bg-gray-100 rounded flex items-center justify-center text-[8px]">ALT</div> + Drag to Pan</li>
              </ul>
@@ -466,6 +597,14 @@ const Lightbox: React.FC<LightboxProps> = ({
   };
 
   const handleMouseDown = (e: React.MouseEvent) => {
+    // Middle click (button 1) for panning
+    if (e.button === 1 || e.altKey) {
+      e.preventDefault();
+      setIsDragging(true);
+      setLastPos({ x: e.clientX, y: e.clientY });
+      return;
+    }
+
     if (zoom > 1) {
       setIsDragging(true);
       setLastPos({ x: e.clientX, y: e.clientY });
@@ -618,6 +757,13 @@ const Lightbox: React.FC<LightboxProps> = ({
             className="max-w-full max-h-[70vh] w-auto h-auto object-contain p-2 md:p-4 pointer-events-none"
           />
         </motion.div>
+
+        {/* Quick Controls Info */}
+        <div className="absolute bottom-6 left-1/2 -translate-x-1/2 flex items-center gap-6 bg-white/60 backdrop-blur px-6 py-2 rounded-full border border-white/40 text-[10px] font-bold text-gray-500 uppercase tracking-widest shadow-lg">
+          <div className="flex items-center gap-2"><div className="w-4 h-4 bg-gray-100 rounded flex items-center justify-center text-[8px]"><MousePointer2 className="w-2 h-2" /></div> Mid-Click to Pan</div>
+          <div className="w-px h-3 bg-gray-200" />
+          <div className="flex items-center gap-2">WHL to Zoom</div>
+        </div>
       </div>
       
       {/* Thumbnails Strip */}
