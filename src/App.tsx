@@ -24,7 +24,9 @@ import {
   RotateCcw,
   Undo2,
   Wand2,
-  MousePointer2
+  MousePointer2,
+  ChevronLeft,
+  ChevronRight
 } from 'lucide-react';
 import { removeBackground } from '@imgly/background-removal';
 import JSZip from 'jszip';
@@ -597,7 +599,7 @@ const Lightbox: React.FC<LightboxProps> = ({
   };
 
   const handleMouseDown = (e: React.MouseEvent) => {
-    // Middle click (button 1) for panning
+    // Middle click (button 1) or Alt key for panning
     if (e.button === 1 || e.altKey) {
       e.preventDefault();
       setIsDragging(true);
@@ -605,26 +607,18 @@ const Lightbox: React.FC<LightboxProps> = ({
       return;
     }
 
+    // Left click panning if zoomed in
     if (zoom > 1) {
       setIsDragging(true);
       setLastPos({ x: e.clientX, y: e.clientY });
     }
   };
 
-  const handleMouseMove = (e: React.MouseEvent) => {
-    if (isDragging) {
-      const dx = e.clientX - lastPos.x;
-      const dy = e.clientY - lastPos.y;
-      setPan(prev => ({ x: prev.x + dx, y: prev.y + dy }));
-      setLastPos({ x: e.clientX, y: e.clientY });
-    }
-  };
-
-  const handleMouseUp = () => {
-    setIsDragging(false);
-  };
-
   const handleWheel = (e: React.WheelEvent) => {
+    // Prevent default to prevent page scroll while zooming
+    if (e.ctrlKey || zoom > 1) {
+      // e.preventDefault(); // Note: React passive listener might warn, but often handled by container
+    }
     const delta = e.deltaY > 0 ? 0.9 : 1.1;
     const newZoom = Math.min(Math.max(zoom * delta, 0.5), 10);
     setZoom(newZoom);
@@ -716,9 +710,16 @@ const Lightbox: React.FC<LightboxProps> = ({
         className="flex-1 relative bg-[#F9F9FB] flex items-center justify-center overflow-hidden p-8 md:p-16 select-none"
         onWheel={handleWheel}
         onMouseDown={handleMouseDown}
-        onMouseMove={handleMouseMove}
-        onMouseUp={handleMouseUp}
-        onMouseLeave={handleMouseUp}
+        onMouseMove={(e) => {
+          if (isDragging) {
+            const dx = e.clientX - lastPos.x;
+            const dy = e.clientY - lastPos.y;
+            setPan(prev => ({ x: prev.x + dx, y: prev.y + dy }));
+            setLastPos({ x: e.clientX, y: e.clientY });
+          }
+        }}
+        onMouseUp={() => setIsDragging(false)}
+        onMouseLeave={() => setIsDragging(false)}
         style={{ cursor: zoom > 1 ? (isDragging ? 'grabbing' : 'grab') : 'default' }}
       >
         <div className="absolute inset-0 flex items-center justify-between px-6 pointer-events-none z-10">
@@ -727,36 +728,42 @@ const Lightbox: React.FC<LightboxProps> = ({
             className="p-4 bg-white/80 backdrop-blur hover:bg-white rounded-full shadow-lg pointer-events-auto transition-all translate-x-0 active:scale-95 disabled:opacity-30"
             disabled={files.length <= 1}
           >
-            <RotateCcw className="w-6 h-6 -scale-x-100" />
+            <ChevronLeft className="w-6 h-6 text-gray-800" />
           </button>
           <button 
             onClick={(e) => { e.stopPropagation(); onNext(); handleReset(); }}
             className="p-4 bg-white/80 backdrop-blur hover:bg-white rounded-full shadow-lg pointer-events-auto transition-all active:scale-95 disabled:opacity-30"
             disabled={files.length <= 1}
           >
-            <RotateCcw className="w-6 h-6" />
+            <ChevronRight className="w-6 h-6 text-gray-800" />
           </button>
         </div>
 
-        <motion.div 
-          key={file.id + showOriginal}
-          initial={{ opacity: 0, scale: 0.95 }}
-          animate={{ opacity: 1, scale: 1 }}
-          transition={{ duration: 0.3, ease: [0.22, 1, 0.36, 1] }}
+        {/* Pan and Zoom Viewport */}
+        <div 
+          className="relative w-full h-full flex items-center justify-center transition-transform duration-200 ease-out"
           style={{
             transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
             transformOrigin: 'center center',
+            transition: isDragging ? 'none' : 'transform 0.2s ease-out'
           }}
-          className={`relative max-w-full max-h-full rounded-2xl overflow-hidden shadow-2xl transition-shadow ${
-            !showOriginal ? 'bg-transparency shadow-blue-500/10' : 'bg-white'
-          }`}
         >
-          <img 
-            src={showOriginal ? file.preview : (file.processedUrl || file.preview)} 
-            alt="Full size preview" 
-            className="max-w-full max-h-[70vh] w-auto h-auto object-contain p-2 md:p-4 pointer-events-none"
-          />
-        </motion.div>
+          <motion.div 
+            key={file.id + showOriginal}
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            transition={{ duration: 0.3, ease: [0.22, 1, 0.36, 1] }}
+            className={`relative max-w-full max-h-full rounded-2xl overflow-hidden shadow-2xl transition-shadow ${
+              !showOriginal ? 'bg-transparency shadow-blue-500/10' : 'bg-white'
+            }`}
+          >
+            <img 
+              src={showOriginal ? file.preview : (file.processedUrl || file.preview)} 
+              alt="Full size preview" 
+              className="max-w-full max-h-[70vh] w-auto h-auto object-contain p-2 md:p-4 pointer-events-none"
+            />
+          </motion.div>
+        </div>
 
         {/* Quick Controls Info */}
         <div className="absolute bottom-6 left-1/2 -translate-x-1/2 flex items-center gap-6 bg-white/60 backdrop-blur px-6 py-2 rounded-full border border-white/40 text-[10px] font-bold text-gray-500 uppercase tracking-widest shadow-lg">
@@ -807,9 +814,7 @@ export default function App() {
 
   const addFiles = (newFiles: File[]) => {
     const newProcessedFiles: ProcessedFile[] = newFiles.map(file => ({
-      id: typeof crypto !== 'undefined' && crypto.randomUUID 
-        ? crypto.randomUUID() 
-        : `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      id: `file-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`,
       file,
       preview: URL.createObjectURL(file),
       processedUrl: null,
@@ -1110,6 +1115,7 @@ export default function App() {
       <AnimatePresence>
         {currentEditingFile && (
           <MaskEditor 
+            key={`editor-${currentEditingFile.id}`}
             fileItem={currentEditingFile} 
             onClose={() => setEditingFileId(null)} 
             onSave={handleEditSave}
@@ -1117,6 +1123,7 @@ export default function App() {
         )}
         {previewFileId && (
           <Lightbox 
+            key={`lightbox-${previewFileId}`}
             files={files.filter(f => f.status === 'done')}
             currentIndex={files.filter(f => f.status === 'done').findIndex(f => f.id === previewFileId)}
             onClose={() => setPreviewFileId(null)}
