@@ -1,0 +1,6 @@
+{
+  "name": "GhostBG - Pro Background Remover",
+  "description": "Fast, free, and multi-file background removal entirely in your browser. Privacy-focused and easy to use.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
