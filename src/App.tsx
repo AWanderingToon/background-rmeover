@@ -44,6 +44,8 @@ interface GifFrame {
   processedUrl: string | null;
   maskUrl: string | null;
   delay: number;
+  subject?: string;
+  category?: string;
 }
 
 interface ProcessedFile {
@@ -52,13 +54,15 @@ interface ProcessedFile {
   preview: string;
   processedUrl: string | null;
   maskUrl: string | null; 
-  status: 'pending' | 'processing' | 'done' | 'error';
+  status: 'pending' | 'analyzing' | 'processing' | 'done' | 'error';
   error?: string;
   progress: number;
   startTime?: number;
   estimatedSeconds?: number;
   gifFps?: number;
   totalFrames?: number;
+  subject?: string;
+  category?: string;
   gifFrames?: GifFrame[]; // Added for frame-by-frame editing
 }
 
@@ -1022,7 +1026,7 @@ export default function App() {
       renderCanvas.height = height;
       const rCtx = renderCanvas.getContext('2d', { willReadFrequently: true })!;
 
-      setFiles(prev => prev.map(f => f.id === id ? { ...f, status: 'processing', progress: 5 } : f));
+      setFiles(prev => prev.map(f => f.id === id ? { ...f, status: 'analyzing', progress: 5 } : f));
 
       let lastImageData: ImageData | null = null;
 
@@ -1076,6 +1080,15 @@ export default function App() {
       const originalFps = 1000 / originalDelay;
       const skipFactor = Math.max(1, Math.round(originalFps / targetFps));
       const targetFrames = fullFrameBlobs.filter((_, idx) => idx % skipFactor === 0);
+      
+      // AI Analysis on first frame
+      let subjectData = { subject: 'Unknown', category: 'General' };
+      try {
+        subjectData = await analyzeSubject(targetFrames[0].blob);
+        setFiles(prev => prev.map(f => f.id === id ? { ...f, subject: subjectData.subject, category: subjectData.category } : f));
+      } catch (err) {
+        console.warn('AI Analysis failed for GIF, proceeding:', err);
+      }
       
       const totalFrames = targetFrames.length;
       setFiles(prev => prev.map(f => f.id === id ? { ...f, totalFrames } : f));
@@ -1165,20 +1178,54 @@ export default function App() {
     });
   };
 
+  const analyzeSubject = async (file: File | Blob): Promise<{ subject: string, category: string }> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = async () => {
+        try {
+          const base64 = (reader.result as string).split(',')[1];
+          const response = await fetch('/api/analyze-subject', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ image: base64, mimeType: file.type || 'image/png' })
+          });
+          if (!response.ok) throw new Error('API analysis failed');
+          const data = await response.json();
+          resolve(data);
+        } catch (err) {
+          reject(err);
+        }
+      };
+      reader.onerror = () => reject(new Error('Failed to read file'));
+      reader.readAsDataURL(file);
+    });
+  };
+
   const processFile = async (id: string) => {
     const fileItem = files.find(f => f.id === id);
-    if (!fileItem || fileItem.status === 'processing') return;
+    if (!fileItem || fileItem.status === 'processing' || fileItem.status === 'analyzing') return;
 
     if (fileItem.file.type === 'image/gif') {
-      setFiles(prev => prev.map(f => f.id === id ? { ...f, status: 'processing', progress: 0, startTime: Date.now() } : f));
+      setFiles(prev => prev.map(f => f.id === id ? { ...f, status: 'analyzing', progress: 0, startTime: Date.now() } : f));
       await processGif(id, fileItem.file);
       return;
     }
 
-    setFiles(prev => prev.map(f => f.id === id ? { ...f, status: 'processing', progress: 10, startTime: Date.now() } : f));
+    setFiles(prev => prev.map(f => f.id === id ? { ...f, status: 'analyzing', progress: 0, startTime: Date.now() } : f));
 
     try {
       const startTime = Date.now();
+      
+      // AI Analysis Phase
+      let subjectData = { subject: 'Unknown', category: 'General' };
+      try {
+        subjectData = await analyzeSubject(fileItem.file);
+        setFiles(prev => prev.map(f => f.id === id ? { ...f, subject: subjectData.subject, category: subjectData.category } : f));
+      } catch (err) {
+        console.warn('AI Analysis failed, proceeding with default settings:', err);
+      }
+
+      setFiles(prev => prev.map(f => f.id === id ? { ...f, status: 'processing', progress: 10 } : f));
 
       // Preliminary check if resolution enforcement is on
       const img = new Image();
@@ -1446,7 +1493,7 @@ export default function App() {
                       onClick={() => file.status === 'done' && setPreviewFileId(file.id)}
                     >
                        <div 
-                         className={`w-full h-full p-2 transition-all duration-700 ${file.status === 'processing' ? 'scale-90 opacity-40 blur-sm' : 'scale-100 opacity-100'} ${file.status === 'done' ? 'bg-transparency' : ''}`}
+                         className={`w-full h-full p-2 transition-all duration-700 ${(file.status === 'processing' || file.status === 'analyzing') ? 'scale-90 opacity-40 blur-sm' : 'scale-100 opacity-100'} ${file.status === 'done' ? 'bg-transparency' : ''}`}
                        >
                          <img 
                             src={file.processedUrl || file.preview} 
@@ -1469,9 +1516,21 @@ export default function App() {
                        </div>
 
                        {/* Loading Spinner */}
-                        {file.status === 'processing' && (
+                        {(file.status === 'processing' || file.status === 'analyzing') && (
                           <div className="absolute inset-0 flex flex-col items-center justify-center gap-3">
-                            <div className="w-8 h-8 border-[3px] border-blue-600 border-t-transparent rounded-full animate-spin" />
+                            {file.status === 'analyzing' ? (
+                              <div className="flex flex-col items-center gap-2">
+                                <motion.div
+                                  animate={{ scale: [1, 1.2, 1], rotate: [0, 10, -10, 0] }}
+                                  transition={{ repeat: Infinity, duration: 2 }}
+                                >
+                                  <Wand2 className="w-8 h-8 text-blue-600" />
+                                </motion.div>
+                                <span className="text-[10px] font-black text-blue-600 uppercase tracking-widest text-center">Identifying Subject...</span>
+                              </div>
+                            ) : (
+                              <div className="w-8 h-8 border-[3px] border-blue-600 border-t-transparent rounded-full animate-spin" />
+                            )}
                             <div className="bg-white/80 px-2 py-0.5 rounded-full text-center">
                                <p className="text-[10px] font-black text-blue-600 tracking-tighter">{file.progress}%</p>
                                {file.file.type === 'image/gif' ? (
@@ -1480,7 +1539,7 @@ export default function App() {
                                      {formatDuration(Math.max(1, (avgFrameSpeed * file.totalFrames * (1 - file.progress / 100))))} left
                                    </p>
                                  )
-                               ) : (
+                                ) : (
                                  avgSpeed && (
                                    <p className="text-[8px] font-bold text-gray-400 uppercase tracking-tight mt-0.5">
                                      {formatDuration(Math.max(1, (avgSpeed * (file.file.size / 1024 / 1024)) * (1 - file.progress / 100)))} left
@@ -1517,7 +1576,7 @@ export default function App() {
                           ) : (
                              <button 
                                onClick={() => processFile(file.id)}
-                               disabled={file.status === 'processing'}
+                               disabled={file.status === 'processing' || file.status === 'analyzing'}
                                className="flex-1 bg-blue-600 text-white font-bold text-xs py-2 rounded-lg shadow-sm hover:bg-blue-700 transition-colors flex items-center justify-center"
                              >
                                Remove BG
@@ -1528,7 +1587,14 @@ export default function App() {
 
                     <div className="px-1 flex items-center justify-between min-w-0">
                       <div className="flex-1 min-w-0">
-                        <p className="text-xs font-bold text-gray-900 truncate tracking-tight">{file.file.name}</p>
+                        <div className="flex items-center gap-2 mb-1">
+                          <p className="text-xs font-bold text-gray-900 truncate tracking-tight">{file.file.name}</p>
+                          {file.subject && (
+                            <span className="shrink-0 px-1.5 py-0.5 bg-blue-50 text-blue-600 text-[8px] font-black uppercase tracking-widest rounded-md border border-blue-100">
+                              {file.subject}
+                            </span>
+                          )}
+                        </div>
                         <div className="flex items-center gap-2 mt-0.5">
                            <p className="text-[10px] text-gray-400 font-bold uppercase tracking-widest">{(file.file.size / 1024 / 1024).toFixed(2)} MB</p>
                            {file.status === 'done' && (
@@ -1537,10 +1603,12 @@ export default function App() {
                            <p className={`text-[10px] font-bold uppercase tracking-widest ${
                              file.status === 'done' ? 'text-green-500' : 
                              file.status === 'processing' ? 'text-blue-500' : 
+                             file.status === 'analyzing' ? 'text-purple-500' :
                              file.status === 'error' ? 'text-red-500' : 'text-gray-300'
                            }`}>
                              {file.status === 'done' ? 'Ready' : 
-                              file.status === 'processing' ? 'Processing' : 
+                              file.status === 'processing' ? 'Removing' : 
+                              file.status === 'analyzing' ? 'Analyzing' :
                               file.status === 'error' ? 'Failed' : 'Pending'}
                            </p>
                         </div>
