@@ -28,7 +28,8 @@ import {
   ChevronLeft,
   ChevronRight,
   Settings,
-  Maximize
+  Maximize,
+  Sparkles
 } from 'lucide-react';
 import { removeBackground } from '@imgly/background-removal';
 import JSZip from 'jszip';
@@ -926,7 +927,10 @@ export default function App() {
   const [settings, setSettings] = useState({
     enforceResolution: false,
     targetWidth: 1080,
-    targetHeight: 1080
+    targetHeight: 1080,
+    highPrecision: false,
+    includeShadow: false,
+    strictCut: true
   });
   const [avgFrameSpeed, setAvgFrameSpeed] = useState<number | null>(null); // seconds per frame for GIFs
 
@@ -1103,11 +1107,18 @@ export default function App() {
           const frameStartTime = Date.now();
           
           try {
-            const processedBlob = await removeBackground(targetFrames[idx].blob);
+            const processedBlob = await preprocessForMask(targetFrames[idx].blob);
+            // @ts-ignore
+            const maskBlob = await removeBackground(processedBlob, {
+              model: settings.highPrecision ? 'isnet' : 'isnet_quint8',
+              output: { type: 'mask' } as any
+            });
+            const processedBlobWithMask = await applyMask(targetFrames[idx].blob, maskBlob);
+
             processedGifFrames[idx] = {
               originalBlob: targetFrames[idx].blob,
               previewUrl: URL.createObjectURL(targetFrames[idx].blob),
-              processedUrl: URL.createObjectURL(processedBlob),
+              processedUrl: URL.createObjectURL(processedBlobWithMask),
               maskUrl: null,
               delay: targetFrames[idx].delay
             };
@@ -1178,6 +1189,53 @@ export default function App() {
     });
   };
 
+  const preprocessForMask = async (file: File | Blob): Promise<Blob> => {
+    return new Promise((resolve) => {
+      const img = new Image();
+      const url = URL.createObjectURL(file);
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext('2d')!;
+        
+        ctx.drawImage(img, 0, 0);
+        
+        // 1. High-Contrast Base for Masking
+        // We boost contrast to help AI distinguish between subject and background
+        // but we avoid making it too dark (0.9 vs 0.85)
+        ctx.filter = 'contrast(1.6) brightness(0.9) saturate(1.1)';
+        ctx.drawImage(canvas, 0, 0);
+
+        // 2. Head-Aware Edge Sharpening
+        // Roblox heads often disappear if they are white. We sharpen edges to define boundaries.
+        ctx.save();
+        ctx.filter = 'contrast(1.5) blur(0.5px)';
+        ctx.globalAlpha = 0.3;
+        ctx.drawImage(canvas, 1, 1);
+        ctx.restore();
+
+        // 3. Central Focus (Vignette)
+        // Focus on the vertical center but avoid the very top (y=0 area)
+        const gradient = ctx.createRadialGradient(
+          canvas.width / 2, canvas.height * 0.5, 0,
+          canvas.width / 2, canvas.height * 0.55, Math.max(canvas.width, canvas.height) * 0.8
+        );
+        gradient.addColorStop(0, 'rgba(0,0,0,0)');
+        gradient.addColorStop(0.6, 'rgba(0,0,0,0.05)');
+        gradient.addColorStop(1, 'rgba(0,0,0,0.3)');
+        ctx.fillStyle = gradient;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        
+        canvas.toBlob(b => {
+          URL.revokeObjectURL(url);
+          resolve(b!);
+        }, 'image/png');
+      };
+      img.src = url;
+    });
+  };
+
   const analyzeSubject = async (file: File | Blob): Promise<{ subject: string, category: string }> => {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -1198,6 +1256,84 @@ export default function App() {
       };
       reader.onerror = () => reject(new Error('Failed to read file'));
       reader.readAsDataURL(file);
+    });
+  };
+
+  const applyMask = async (originalFile: File | Blob, maskBlob: Blob): Promise<Blob> => {
+    return new Promise((resolve) => {
+      const originalImg = new Image();
+      const maskImg = new Image();
+      const originalUrl = URL.createObjectURL(originalFile);
+      const maskUrl = URL.createObjectURL(maskBlob);
+      
+      let loaded = 0;
+      const checkLoaded = () => {
+        loaded++;
+        if (loaded === 2) {
+          const width = originalImg.width;
+          const height = originalImg.height;
+
+          // 1. Thresholded Mask Canvas
+          const maskCanvas = document.createElement('canvas');
+          maskCanvas.width = width;
+          maskCanvas.height = height;
+          const mctx = maskCanvas.getContext('2d')!;
+          mctx.drawImage(maskImg, 0, 0, width, height);
+
+          if (settings.strictCut) {
+            const imageData = mctx.getImageData(0, 0, width, height);
+            const data = imageData.data;
+            for (let i = 0; i < data.length; i += 4) {
+              const alpha = data[i+3];
+              // Robust thresholding: AI confidence > 15% becomes solid, < 5% becomes hidden
+              if (alpha > 40) data[i+3] = 255;
+              else if (alpha < 15) data[i+3] = 0;
+              // values in between 15-40 are kept for slight anti-aliasing
+            }
+            mctx.putImageData(imageData, 0, 0);
+          }
+
+          // 2. Character-Only Canvas (Transparent)
+          const charCanvas = document.createElement('canvas');
+          charCanvas.width = width;
+          charCanvas.height = height;
+          const cctx = charCanvas.getContext('2d')!;
+          cctx.drawImage(originalImg, 0, 0);
+          cctx.globalCompositeOperation = 'destination-in';
+          cctx.drawImage(maskCanvas, 0, 0);
+
+          // 3. Final Composite
+          const finalCanvas = document.createElement('canvas');
+          finalCanvas.width = width;
+          finalCanvas.height = height;
+          const fctx = finalCanvas.getContext('2d')!;
+
+          if (settings.includeShadow) {
+            fctx.save();
+            fctx.shadowColor = 'rgba(0, 0, 0, 0.4)';
+            fctx.shadowBlur = 20;
+            fctx.shadowOffsetX = 12;
+            fctx.shadowOffsetY = 12;
+            // Draw character again to cast shadow on this layer
+            fctx.drawImage(charCanvas, 0, 0);
+            fctx.restore();
+          }
+
+          // Draw actual character on top
+          fctx.drawImage(charCanvas, 0, 0);
+          
+          finalCanvas.toBlob(b => {
+             URL.revokeObjectURL(originalUrl);
+             URL.revokeObjectURL(maskUrl);
+             resolve(b!);
+          }, 'image/png');
+        }
+      };
+      
+      originalImg.onload = checkLoaded;
+      maskImg.onload = checkLoaded;
+      originalImg.src = originalUrl;
+      maskImg.src = maskUrl;
     });
   };
 
@@ -1244,17 +1380,22 @@ export default function App() {
       }
       URL.revokeObjectURL(fileUrl);
 
-      const blob = await removeBackground(fileItem.file, {
+      let finalBlob: Blob;
+
+      const processedBlobForMask = await preprocessForMask(fileItem.file);
+      // @ts-ignore
+      const maskBlob = await removeBackground(processedBlobForMask, {
+        model: settings.highPrecision ? 'isnet' : 'isnet_quint8',
+        output: { type: 'mask' } as any,
         progress: (p: any) => {
-           setFiles(prev => prev.map(f => f.id === id ? { ...f, progress: Math.round((p as number) * 100) } : f));
+          setFiles(prev => prev.map(f => f.id === id ? { ...f, progress: Math.round((p as number) * 100) } : f));
         }
       });
-
-      let finalBlob = blob;
+      finalBlob = await applyMask(fileItem.file, maskBlob);
 
       if (settings.enforceResolution) {
         const processedImg = new Image();
-        const processedUrl = URL.createObjectURL(blob);
+        const processedUrl = URL.createObjectURL(finalBlob);
         processedImg.src = processedUrl;
         await new Promise(res => processedImg.onload = res);
 
@@ -1787,6 +1928,71 @@ export default function App() {
                         </div>
                       </div>
                     </section>
+
+                    <section>
+                      <h3 className="font-bold text-gray-900 mb-4 tracking-tight flex items-center gap-2">
+                        <Sparkles className="w-5 h-5 text-purple-600" /> Quality Settings
+                      </h3>
+                      <div className="space-y-3">
+                        <div className="flex items-center justify-between p-4 bg-gray-50 rounded-2xl">
+                          <div className="flex items-center gap-3">
+                            <div className="w-8 h-8 bg-purple-50 rounded-lg flex items-center justify-center">
+                              <Sparkles className="w-4 h-4 text-purple-600" />
+                            </div>
+                            <div>
+                              <p className="font-bold text-sm text-gray-900">High Precision</p>
+                              <p className="text-[10px] text-gray-400 font-bold uppercase tracking-widest mt-0.5">Better for non-human subjects</p>
+                            </div>
+                          </div>
+                          <button 
+                            onClick={() => setSettings(s => ({ ...s, highPrecision: !s.highPrecision }))}
+                            className={`w-12 h-6 rounded-full transition-colors relative ${settings.highPrecision ? 'bg-purple-600' : 'bg-gray-200'}`}
+                          >
+                            <div className={`absolute top-1 w-4 h-4 rounded-full bg-white transition-all ${settings.highPrecision ? 'left-7' : 'left-1'}`} />
+                          </button>
+                        </div>
+
+                        <div className="flex items-center justify-between p-4 bg-gray-50 rounded-2xl">
+                          <div className="flex items-center gap-3">
+                            <div className="w-8 h-8 bg-orange-50 rounded-lg flex items-center justify-center">
+                              <Maximize className="w-4 h-4 text-orange-600" />
+                            </div>
+                            <div>
+                              <p className="font-bold text-sm text-gray-900">Strict Cut</p>
+                              <p className="text-[10px] text-gray-400 font-bold uppercase tracking-widest mt-0.5">Removes semi-transparency</p>
+                            </div>
+                          </div>
+                          <button 
+                            onClick={() => setSettings(s => ({ ...s, strictCut: !s.strictCut }))}
+                            className={`w-12 h-6 rounded-full transition-colors relative ${settings.strictCut ? 'bg-orange-600' : 'bg-gray-200'}`}
+                          >
+                            <div className={`absolute top-1 w-4 h-4 rounded-full bg-white transition-all ${settings.strictCut ? 'left-7' : 'left-1'}`} />
+                          </button>
+                        </div>
+
+                        <div className="flex items-center justify-between p-4 bg-gray-50 rounded-2xl">
+                          <div className="flex items-center gap-3">
+                            <div className="w-8 h-8 bg-blue-50 rounded-lg flex items-center justify-center">
+                              <Settings className="w-4 h-4 text-blue-600" />
+                            </div>
+                            <div>
+                              <p className="font-bold text-sm text-gray-900">Add Shadow</p>
+                              <p className="text-[10px] text-gray-400 font-bold uppercase tracking-widest mt-0.5">Professional depth effect</p>
+                            </div>
+                          </div>
+                          <button 
+                            onClick={() => setSettings(s => ({ ...s, includeShadow: !s.includeShadow }))}
+                            className={`w-12 h-6 rounded-full transition-colors relative ${settings.includeShadow ? 'bg-blue-600' : 'bg-gray-200'}`}
+                          >
+                            <div className={`absolute top-1 w-4 h-4 rounded-full bg-white transition-all ${settings.includeShadow ? 'left-7' : 'left-1'}`} />
+                          </button>
+                        </div>
+                      </div>
+
+                      <p className="text-[10px] text-gray-400 mt-3 px-1 leading-relaxed">
+                        Uses a larger AI model for complex edge detection. Strict Cut helps with Roblox/Game avatars that have sharp boundaries.
+                      </p>
+                    </section>
                   </div>
                 )}
               </div>
@@ -1836,6 +2042,7 @@ export default function App() {
           <div className="flex items-center gap-2">
             <span className="text-blue-600 border border-blue-100 bg-blue-50 px-2 py-0.5 rounded">Speed Boost: {hardwareInfo.tech}</span>
           </div>
+          <span className="text-gray-300">v1.2.4-stable</span>
         </div>
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-1.5 px-3 py-1 bg-green-50 text-green-600 rounded-full border border-green-100">
